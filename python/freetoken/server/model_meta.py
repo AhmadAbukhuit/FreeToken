@@ -1,0 +1,74 @@
+"""Model-derived facts the server publishes to its clients.
+
+These used to sit in the shell's TUI module, back when the shell ran inside the server
+process and could read ``ServerArgs`` directly. The shell is an ordinary HTTP client now,
+so they belong on the server side of the wire: ``/v1/cache/status`` is what hands them out
+(``geometry.reasoning`` for the thinking gears, ``geometry.moe_*`` for the cache panel).
+"""
+
+from __future__ import annotations
+
+import math
+from typing import Any, Tuple
+
+
+def think_spec(reasoning_parser: str | None) -> Tuple[Tuple[str, ...], str | None]:
+    """Return ``(gears, default_gear)`` a client can offer for a model family, keyed by its
+    configured reasoning parser. ``((), None)`` when the model has no controllable thinking.
+    Verified per family against each model's chat template / encoder."""
+    if reasoning_parser == "gpt_oss":
+        return ("low", "medium", "high"), "medium"  # always-on, 3-level effort
+    if reasoning_parser == "deepseekv32":
+        return ("off", "on", "max"), "off"  # thinking on/off + a max-effort gear
+    if reasoning_parser == "minimax":
+        return ("on",), "on"  # template always opens a think block; no off path
+    if reasoning_parser == "gemma4":
+        return ("off", "on"), "off"  # gemma's template defaults thinking off
+    if reasoning_parser in ("qwen3", "glm"):
+        return ("off", "on"), "on"
+    return (), None
+
+
+def think_chat_template_kwargs(reasoning_parser: str | None, gear: str | None) -> dict:
+    """The ``chat_template_kwargs`` that select ``gear`` for the model family."""
+    if gear is None:
+        return {}
+    if reasoning_parser == "gpt_oss":
+        return {"reasoning_effort": gear}
+    if reasoning_parser == "deepseekv32":
+        if gear == "max":
+            return {"enable_thinking": True, "reasoning_effort": "max"}
+        return {"enable_thinking": gear == "on"}
+    if reasoning_parser == "minimax":
+        return {}  # always thinks; its template reads no knob
+    return {"enable_thinking": gear == "on"}  # qwen3, glm, gemma4
+
+
+def moe_total_experts(config: Any) -> int:
+    """Total routed-expert slots the model has: experts per layer x MoE layers. Matches the
+    engine's own basis (``Engine._resolve_auto_moe_cache_size``), so a residency rate derived
+    from it agrees with the size the engine resolved -- ``num_moe_layers`` excludes the leading
+    dense layers a model like DSV4 carries."""
+    try:
+        model_config = config.model_config
+    except Exception:  # noqa: BLE001 -- dummy/absent config: report "unknown", never raise
+        return 0
+    return int(getattr(model_config, "num_moe_layers", 0) or 0) * int(
+        getattr(model_config, "num_experts", 0) or 0
+    )
+
+
+def moe_cache_size(config: Any) -> int:
+    """The configured MoE slot-cache size, resolving ``--moe-cache-rate`` to a slot count.
+    Only a fallback for the reported geometry: the engine's actual allocation (from the
+    ready ack, or a rebuild) wins wherever it is known."""
+    cache_size = int(getattr(config, "moe_cache_size", 0) or 0)
+    if cache_size > 0:
+        return cache_size
+    cache_rate = getattr(config, "moe_cache_rate", None)
+    if cache_rate is None:
+        return cache_size
+    total_experts = moe_total_experts(config)
+    if total_experts <= 0:
+        return cache_size
+    return math.ceil(total_experts * float(cache_rate))

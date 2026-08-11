@@ -1,0 +1,2762 @@
+# Adapted from LightLLM [https://github.com/ModelTC/lightllm/blob/main/lightllm/server/function_call_parser.py]
+# Copyright 2025 ModelTC Team
+# Copyright 2023-2024 SGLang Team
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#     http://www.apache.org/licenses/LICENSE-2.0
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import ast
+import json
+import os
+import logging
+import re
+from abc import ABC, abstractmethod
+from json import JSONDecodeError, JSONDecoder
+from json.decoder import WHITESPACE
+from typing import Any, Dict, List, Optional, Tuple, Type
+
+import partial_json_parser
+from partial_json_parser.core.exceptions import MalformedJSON
+from partial_json_parser.core.options import Allow
+from pydantic import BaseModel
+
+from .api_models import Function, Tool
+
+try:
+    import orjson
+except ModuleNotFoundError:  # FreeToken does not require orjson.
+    class _OrjsonCompat:
+        @staticmethod
+        def loads(value: str) -> Any:
+            return json.loads(value)
+
+    orjson = _OrjsonCompat()
+
+logger = logging.getLogger(__name__)
+_TRUE_ENV_VALUES = {"ON", "TRUE", "1", "YES"}
+_LIGHTLLM_ENABLE_TOOL_NAME_CHECK = os.getenv("LIGHTLLM_ENABLE_TOOL_NAME_CHECK")
+if _LIGHTLLM_ENABLE_TOOL_NAME_CHECK is not None:
+    FORWARD_UNKNOWN_TOOLS = _LIGHTLLM_ENABLE_TOOL_NAME_CHECK.upper() not in _TRUE_ENV_VALUES
+else:
+    FORWARD_UNKNOWN_TOOLS = (
+        os.getenv("FREETOKEN_FORWARD_UNKNOWN_TOOLS", os.getenv("SGLANG_FORWARD_UNKNOWN_TOOLS", "True")).upper()
+        in _TRUE_ENV_VALUES
+    )
+
+
+def _should_forward_unknown_tool(name: Any) -> bool:
+    return FORWARD_UNKNOWN_TOOLS or (isinstance(name, str) and ":" in name)
+
+
+TOOLS_TAG_LIST = [
+    "<|plugin|>",
+    "<|tool_call>",
+    "<|tool_call_begin|>",
+    "<|channel|>",
+    "<function=",
+    "<tool_call>",
+    "<minimax:tool_call>",
+    "<|python_tag|>",
+    "[TOOL_CALLS]",
+    "<｜DSML｜function_calls>",
+    "<｜DSML｜tool_calls>",
+    "<｜DSML｜invoke",
+]
+
+
+class ToolCallItem(BaseModel):
+    """Simple encapsulation of the parsed ToolCall result for easier usage in streaming contexts."""
+
+    tool_index: int
+    name: Optional[str] = None
+    parameters: str  # JSON string
+
+
+class StreamingParseResult:
+    """Result of streaming incremental parsing."""
+
+    def __init__(self, normal_text: str = "", calls: Optional[List[ToolCallItem]] = None):
+        self.normal_text = normal_text
+        self.calls = calls or []
+
+
+def _first_existing_pos(text: str, tokens: List[str]) -> int:
+    positions = [text.find(token) for token in tokens if token in text]
+    return min(positions) if positions else -1
+
+
+def _find_common_prefix(s1: str, s2: str) -> str:
+    prefix = ""
+    min_length = min(len(s1), len(s2))
+    for i in range(0, min_length):
+        if s1[i] == s2[i]:
+            prefix += s1[i]
+        else:
+            break
+    return prefix
+
+
+def _partial_json_loads(input_str: str, flags: Allow) -> Tuple[Any, int]:
+    """
+    Parse incomplete or partial JSON strings commonly encountered during streaming.
+
+    Args:
+        input_str (str): The potentially incomplete JSON string to parse.
+        flags (Allow): Bitwise flags controlling what types of partial data are allowed.
+            Common flags include:
+            - Allow.STR: Allow partial strings (e.g., '"hello wo' -> 'hello wo')
+            - Allow.OBJ: Allow partial objects (e.g., '{"key":' -> {'key': None})
+            - Allow.ARR: Allow partial arrays (e.g., '[1, 2,' -> [1, 2])
+            - Allow.ALL: Allow all types of partial data
+
+    Returns:
+        Tuple[Any, int]: A tuple containing:
+            - parsed_object: The Python object parsed from the JSON
+            - consumed_length: Number of characters consumed from input_str
+    """
+    try:
+        return (partial_json_parser.loads(input_str, flags), len(input_str))
+    except (JSONDecodeError, IndexError) as e:
+        msg = getattr(e, "msg", str(e))
+        if "Extra data" in msg or "pop from empty list" in msg:
+            start = WHITESPACE.match(input_str, 0).end()
+            obj, end = JSONDecoder().raw_decode(input_str, start)
+            return obj, end
+        raise
+
+
+def _is_complete_json(input_str: str) -> bool:
+    try:
+        orjson.loads(input_str)
+        return True
+    except JSONDecodeError:
+        return False
+
+
+def _parse_loose_json_value(value: str) -> Any:
+    try:
+        return json.loads(value)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        if value.lower() == "true":
+            return True
+        if value.lower() == "false":
+            return False
+        if value.lower() == "null":
+            return None
+        return value
+
+
+def _parse_first_json_value(text: str) -> Any:
+    decoder = JSONDecoder()
+    for idx, char in enumerate(text.strip()):
+        if char not in "[{":
+            continue
+        try:
+            value, _ = decoder.raw_decode(text.strip(), idx)
+            return value
+        except JSONDecodeError:
+            return None
+    return None
+
+
+def _split_top_level(text: str, delimiter: str) -> List[str]:
+    parts: List[str] = []
+    start = 0
+    depth = 0
+    in_gemma_string = False
+    i = 0
+    while i < len(text):
+        if text.startswith('<|"|>', i):
+            in_gemma_string = not in_gemma_string
+            i += len('<|"|>')
+            continue
+        if not in_gemma_string:
+            if text[i] in "[{":
+                depth += 1
+            elif text[i] in "]}":
+                depth -= 1
+            elif text[i] == delimiter and depth == 0:
+                parts.append(text[start:i])
+                start = i + 1
+        i += 1
+    parts.append(text[start:])
+    return parts
+
+
+def _parse_gemma_value(value: str) -> Any:
+    value = value.strip()
+    if value.startswith('<|"|>') and value.endswith('<|"|>'):
+        return value[len('<|"|>') : -len('<|"|>')]
+    if value == "true":
+        return True
+    if value == "false":
+        return False
+    if value in ("null", "none", "None"):
+        return None
+    if value.startswith("{") and value.endswith("}"):
+        return _parse_gemma_call_args(value[1:-1])
+    if value.startswith("[") and value.endswith("]"):
+        return [_parse_gemma_value(item) for item in _split_top_level(value[1:-1], ",")]
+    try:
+        return int(value)
+    except ValueError:
+        pass
+    try:
+        return float(value)
+    except ValueError:
+        return value
+
+
+def _parse_gemma_call_args(text: str) -> Dict[str, Any]:
+    args: Dict[str, Any] = {}
+    for item in _split_top_level(text, ","):
+        if not item.strip():
+            continue
+        key, sep, value = item.partition(":")
+        if not sep:
+            continue
+        args[key.strip()] = _parse_gemma_value(value.strip())
+    return args
+
+
+class BaseFormatDetector(ABC):
+    """Base class providing two sets of interfaces: one-time and streaming incremental."""
+
+    # Detectors whose parse_streaming_increment is not incremental-safe (e.g. re-emit
+    # already-released text) set this False; the serving layer then falls back to
+    # buffering the whole generation and calling parse_non_stream at the end.
+    supports_streaming = True
+
+    # Whether emitted argument fragments always concatenate to a prefix of the
+    # call's FINAL arguments JSON. Adapters whose clients concatenate fragments
+    # (Anthropic input_json_delta, OpenAI tool_calls deltas) only stream fragments
+    # when this holds; otherwise they send the full arguments once at close.
+    args_fragments_prefix_stable = True
+
+    def __init__(self):
+        # Streaming state management
+        # Buffer for accumulating incomplete patterns that arrive across multiple streaming chunks
+        self._buffer = ""
+        # Stores complete tool call info (name and arguments) for each tool being parsed.
+        # Used by serving layer for completion handling when streaming ends.
+        # Format: [{"name": str, "arguments": dict}, ...]
+        self.prev_tool_call_arr: List[Dict] = []
+        # Index of currently streaming tool call. Starts at -1 (no active tool),
+        # increments as each tool completes. Tracks which tool's arguments are streaming.
+        self.current_tool_id: int = -1
+        # Flag for whether current tool's name has been sent to client.
+        # Tool names sent first with empty parameters, then arguments stream incrementally.
+        self.current_tool_name_sent: bool = False
+        # Tracks raw JSON string content streamed to client for each tool's arguments.
+        # Critical for serving layer to calculate remaining content when streaming ends.
+        # Each index corresponds to a tool_id. Example: ['{"location": "San Francisco"', '{"temp": 72']
+        self.streamed_args_for_tool: List[str] = []
+
+        # Token configuration (override in subclasses)
+        self.bot_token = ""
+        self.eot_token = ""
+        self.tool_call_separator = ", "
+
+    def _get_tool_indices(self, tools: List[Tool]) -> Dict[str, int]:
+        """
+        Get a mapping of tool names to their indices in the tools list.
+
+        This utility method creates a dictionary mapping function names to their
+        indices in the tools list, which is commonly needed for tool validation
+        and ToolCallItem creation.
+
+        Args:
+            tools: List of available tools
+
+        Returns:
+            Dictionary mapping tool names to their indices
+        """
+        return {tool.function.name: i for i, tool in enumerate(tools) if tool.function.name}
+
+    def parse_base_json(self, action: Any, tools: List[Tool]) -> List[ToolCallItem]:
+        tool_indices = self._get_tool_indices(tools)
+        if not isinstance(action, list):
+            action = [action]
+
+        results = []
+        for act in action:
+            name = act.get("name")
+            if not (name and name in tool_indices):
+                logger.warning(f"Model attempted to call undefined function: {name}")
+                if not _should_forward_unknown_tool(name):
+                    continue
+
+            results.append(
+                ToolCallItem(
+                    tool_index=tool_indices.get(name, -1),
+                    name=name,
+                    parameters=json.dumps(
+                        act.get("parameters") or act.get("arguments", {}),
+                        ensure_ascii=False,
+                    ),
+                )
+            )
+
+        return results
+
+    @abstractmethod
+    def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
+        """
+        Parses the text in one go. Returns success=True if the format matches, otherwise False.
+        Note that leftover_text here represents "content that this parser will not consume further".
+        """
+        action = orjson.loads(text)
+        return StreamingParseResult(calls=self.parse_base_json(action, tools))
+
+    def _ends_with_partial_token(self, buffer: str, bot_token: str) -> int:
+        """
+        Check if buffer ends with a partial bot_token.
+        Return the length of the partial bot_token.
+
+        For some format, the bot_token is not a token in model's vocabulary, such as
+        `[TOOL_CALLS] [` in Mistral.
+        """
+        for i in range(1, min(len(buffer) + 1, len(bot_token))):
+            if bot_token.startswith(buffer[-i:]):
+                return i
+        return 0
+
+    def _get_param_config(self, func_name: str, tools: List[Tool]) -> Dict:
+        """Extract the parameter properties (JSON schema) for one tool."""
+        for tool in tools:
+            if tool.function.name == func_name and tool.function.parameters:
+                params = tool.function.parameters
+                if isinstance(params, dict) and "properties" in params:
+                    return params["properties"]
+                elif isinstance(params, dict):
+                    return params
+        return {}
+
+    def _convert_param_value(self, value: str, param_name: str, param_config: Dict, func_name: str) -> Any:
+        """Convert parameter value based on schema type. Safe alternative to eval()."""
+        if value.lower() == "null":
+            return None
+
+        if param_name not in param_config:
+            return value
+
+        prop = param_config.get(param_name, {})
+        param_type = str(prop.get("type", "string")).strip().lower() if isinstance(prop, dict) else "string"
+
+        if param_type in ("string", "str", "enum"):
+            return value
+        elif param_type.startswith("int") or param_type == "integer":
+            try:
+                return int(value)
+            except (ValueError, TypeError):
+                return value
+        elif param_type in ("number", "float", "double"):
+            try:
+                fv = float(value)
+                return int(fv) if fv == int(fv) else fv
+            except (ValueError, TypeError):
+                return value
+        elif param_type in ("boolean", "bool"):
+            return value.lower() == "true"
+        elif param_type in ("object", "array"):
+            try:
+                return json.loads(value)
+            except (json.JSONDecodeError, TypeError, ValueError):
+                try:
+                    return ast.literal_eval(value)
+                except (ValueError, SyntaxError, TypeError):
+                    return value
+        return value
+
+    def _schema_param_type(self, param_name: str, param_config: Dict, missing: str = "string") -> str:
+        """Normalized schema type for a parameter; ``missing`` when undeclared."""
+        if param_name not in param_config:
+            return missing
+        prop = param_config.get(param_name, {})
+        if not isinstance(prop, dict):
+            return "string"
+        return str(prop.get("type", "string")).strip().lower()
+
+    @staticmethod
+    def _json_escape_chunk(text: str) -> str:
+        """JSON-string-escape a fragment of a value (escaping is per-character, so
+        chunk boundaries are safe)."""
+        return json.dumps(text, ensure_ascii=False)[1:-1]
+
+    def block_close_tokens(self) -> tuple:
+        """Tokens that end a tool block — used to locate text AFTER the last call
+        in one-shot parsing (detect_and_parse only keeps text before the first)."""
+        return (self.eot_token,) if self.eot_token else ()
+
+    def finish_streaming(self) -> str:
+        """End-of-stream drain: return residual buffered text that should be surfaced
+        as normal content. Suppressed when the buffer holds an unfinished tool call
+        (raw tool markup must not leak into content), or when it is only markup
+        debris (closing tag / bare separator) left behind by completed calls."""
+        residual, self._buffer = self._buffer, ""
+        if not residual:
+            return ""
+        if self.has_tool_call(residual) or self.current_tool_name_sent:
+            return ""
+        if self.eot_token and self.eot_token in residual:
+            residual = residual.replace(self.eot_token, "")
+        if self.prev_tool_call_arr and residual.strip() in ("", self.tool_call_separator.strip()):
+            return ""
+        return residual
+
+
+    def parse_streaming_increment(self, new_text: str, tools: List[Tool]) -> StreamingParseResult:
+        """
+        Streaming incremental parsing with tool validation.
+
+        This base implementation works best with formats where:
+        1. bot_token is followed immediately by JSON (e.g., bot_token + JSON_array)
+        2. JSON can be parsed incrementally using partial_json_loads
+        3. Multiple tool calls are separated by "; " or ", "
+
+        Examples of incompatible formats (need custom implementation, may reuse some logic from this class):
+        - Each tool call is wrapped in a separate block: See Qwen25Detector
+        - Multiple separate blocks: [TOOL_CALLS] [...] \n [TOOL_CALLS] [...]
+        - Tool call is Pythonic style
+
+        For incompatible formats, detectors should override this method with custom logic.
+        """
+        # Append new text to buffer
+        self._buffer += new_text
+        current_text = self._buffer
+
+        # The current_text has tool_call if it is the start of a new tool call sequence
+        # or it is the start of a new tool call after a tool call separator, when there is a previous tool call
+        if not (
+            self.has_tool_call(current_text)
+            or (self.current_tool_id > 0 and current_text.startswith(self.tool_call_separator))
+        ):
+            # Only clear buffer if we're sure no tool call is starting
+            if not self._ends_with_partial_token(self._buffer, self.bot_token):
+                normal_text = self._buffer
+                self._buffer = ""
+                if self.eot_token in normal_text:
+                    normal_text = normal_text.replace(self.eot_token, "")
+                return StreamingParseResult(normal_text=normal_text)
+            else:
+                # Might be partial bot_token, keep buffering
+                return StreamingParseResult()
+
+        # Build tool indices if not already built
+        if not hasattr(self, "_tool_indices"):
+            self._tool_indices = self._get_tool_indices(tools)
+
+        flags = Allow.ALL if self.current_tool_name_sent else Allow.ALL & ~Allow.STR
+
+        try:
+            try:
+                tool_call_pos = current_text.find(self.bot_token)
+                if tool_call_pos > 0:
+                    # Normal text precedes the tool tag in this buffer (text and tag
+                    # landed in one chunk): release it before parsing the call so it
+                    # isn't silently dropped when the buffer is later trimmed.
+                    prefix = current_text[:tool_call_pos]
+                    self._buffer = current_text[tool_call_pos:]
+                    if self.eot_token and self.eot_token in prefix:
+                        prefix = prefix.replace(self.eot_token, "")
+                    return StreamingParseResult(normal_text=prefix)
+                if tool_call_pos != -1:
+                    start_idx = tool_call_pos + len(self.bot_token)
+                elif self.current_tool_id > 0 and current_text.startswith(self.tool_call_separator):
+                    start_idx = len(self.tool_call_separator)
+                else:
+                    start_idx = 0
+
+                if start_idx >= len(current_text):
+                    return StreamingParseResult()
+
+                try:
+                    obj, end_idx = _partial_json_loads(current_text[start_idx:], flags)
+                except MalformedJSON:
+                    if tool_call_pos == -1 and not self._ends_with_partial_token(
+                        self._buffer, self.bot_token
+                    ):
+                        after = current_text[start_idx:].lstrip()
+                        if after and after[0] not in "{[":
+                            # Reached via the separator heuristic after a completed
+                            # call, but what follows can never become another call's
+                            # JSON: trailing normal text — release it instead of
+                            # holding forever. A bare separator / whitespace tail
+                            # stays held (the next call's JSON may still arrive).
+                            normal_text = self._buffer
+                            self._buffer = ""
+                            if self.eot_token and self.eot_token in normal_text:
+                                normal_text = normal_text.replace(self.eot_token, "")
+                            return StreamingParseResult(normal_text=normal_text)
+                    return StreamingParseResult()
+
+                is_current_complete = _is_complete_json(current_text[start_idx : start_idx + end_idx])
+
+                # Validate tool name if present
+                if (
+                    "name" in obj
+                    and obj["name"] not in self._tool_indices
+                    and not _should_forward_unknown_tool(obj["name"])
+                ):
+                    # Invalid tool name - reset state
+                    self._buffer = ""
+                    self.current_tool_id = -1
+                    self.current_tool_name_sent = False
+                    if self.streamed_args_for_tool:
+                        self.streamed_args_for_tool.pop()
+                    return StreamingParseResult()
+
+                # Handle parameters/arguments consistency
+                # NOTE: we assume here that the obj is always partial of a single tool call
+                if "parameters" in obj:
+                    assert "arguments" not in obj, "model generated both parameters and arguments"
+                    obj["arguments"] = obj["parameters"]
+
+                current_tool_call = obj
+
+            except MalformedJSON:
+                return StreamingParseResult()
+
+            if not current_tool_call:
+                return StreamingParseResult()
+
+            # Case 1: Handle tool name streaming
+            # This happens when we encounter a tool but haven't sent its name yet
+            if not self.current_tool_name_sent:
+                function_name = current_tool_call.get("name")
+
+                if function_name and (
+                    function_name in self._tool_indices or _should_forward_unknown_tool(function_name)
+                ):
+                    # If this is a new tool (current_tool_id was -1), initialize it
+                    if self.current_tool_id == -1:
+                        self.current_tool_id = 0
+                        self.streamed_args_for_tool.append("")
+                    # If this is a subsequent tool, ensure streamed_args_for_tool is large enough
+                    elif self.current_tool_id >= len(self.streamed_args_for_tool):
+                        while len(self.streamed_args_for_tool) <= self.current_tool_id:
+                            self.streamed_args_for_tool.append("")
+
+                    # Send the tool name with empty parameters
+                    res = StreamingParseResult(
+                        calls=[
+                            ToolCallItem(
+                                tool_index=self.current_tool_id,
+                                name=function_name,
+                                parameters="",
+                            )
+                        ],
+                    )
+                    self.current_tool_name_sent = True
+                else:
+                    res = StreamingParseResult()
+
+            # Case 2: Handle streaming arguments
+            # This happens when we've already sent the tool name and now need to stream arguments incrementally
+            else:
+                cur_arguments = current_tool_call.get("arguments")
+                res = StreamingParseResult()
+
+                # NOTE: `is not None`, not truthiness — an empty-arguments call
+                # ({}) must still take the completion path below so its buffer is
+                # consumed and the call closes exactly once (vLLM's hermes parser
+                # gates on JSON completeness for the same reason).
+                if cur_arguments is not None:
+                    # Calculate how much of the arguments we've already streamed
+                    sent = len(self.streamed_args_for_tool[self.current_tool_id])
+                    cur_args_json = json.dumps(cur_arguments, ensure_ascii=False)
+                    prev_arguments = None
+                    if self.current_tool_id < len(self.prev_tool_call_arr):
+                        prev_arguments = self.prev_tool_call_arr[self.current_tool_id].get("arguments")
+
+                    argument_diff = None
+
+                    # If the current tool's JSON is complete, send all remaining arguments
+                    if is_current_complete:
+                        argument_diff = cur_args_json[sent:]
+                        completing_tool_id = self.current_tool_id  # Save the ID of the tool that's completing
+
+                        # Only remove the processed portion, keep unprocessed content;
+                        # also consume the block's closing tag so it can't jam the
+                        # tool_call_separator heuristic on the next increment.
+                        self._buffer = current_text[start_idx + end_idx :]
+                        if self.eot_token:
+                            after = self._buffer.lstrip()
+                            if after.startswith(self.eot_token):
+                                self._buffer = after[len(self.eot_token):]
+
+                        if self.current_tool_id < len(self.prev_tool_call_arr):
+                            self.prev_tool_call_arr[self.current_tool_id].clear()
+                        self.current_tool_name_sent = False
+                        self.streamed_args_for_tool[self.current_tool_id] = ""
+                        self.current_tool_id += 1
+
+                    # If the tool is still being parsed, send incremental changes
+                    elif prev_arguments:
+                        prev_args_json = json.dumps(prev_arguments, ensure_ascii=False)
+                        if cur_args_json != prev_args_json:
+                            prefix = _find_common_prefix(prev_args_json, cur_args_json)
+                            argument_diff = prefix[sent:]
+
+                    # Send the argument diff if there's something new
+                    if argument_diff is not None:
+                        # Use the correct tool_index: completing_tool_id for completed tools,
+                        # current_tool_id for ongoing
+                        tool_index_to_use = completing_tool_id if is_current_complete else self.current_tool_id
+                        res = StreamingParseResult(
+                            calls=[
+                                ToolCallItem(
+                                    tool_index=tool_index_to_use,
+                                    parameters=argument_diff,
+                                )
+                            ],
+                        )
+                        if not is_current_complete:
+                            self.streamed_args_for_tool[self.current_tool_id] += argument_diff
+
+            # Update prev_tool_call_arr with current state
+            if self.current_tool_id >= 0:
+                # Ensure prev_tool_call_arr is large enough
+                while len(self.prev_tool_call_arr) <= self.current_tool_id:
+                    self.prev_tool_call_arr.append({})
+                self.prev_tool_call_arr[self.current_tool_id] = current_tool_call
+
+            return res
+
+        except Exception as e:
+            logger.error(f"Error in parse_streaming_increment: {e}")
+            return StreamingParseResult()
+
+
+
+class InvokeParamStreamMixin:
+    """Value-level streaming for invoke/parameter block formats (qwen3_coder,
+    minimax — the same shape vLLM's ParserEngine covers): text outside blocks
+    streams live; parameter VALUES whose schema type is string stream char-by-char
+    as JSON-escaped, prefix-stable fragments; typed values buffer until the
+    parameter closes so their JSON form is schema-correct.
+
+    Subclasses define the grammar via class attributes:
+      _ps_outer_open/_ps_outer_close  wrapper block tokens (may equal invoke tokens)
+      _ps_invoke_open_prefix/_ps_invoke_open_re (group 1 = name)/_ps_invoke_close
+      _ps_param_open_prefix/_ps_param_open_re (group 1 = key)/_ps_param_close
+      _ps_trim       chars trimmed around values
+      _ps_trim_single  True: at most ONE leading/trailing trim char (qwen3_coder)
+      _ps_missing_type schema type assumed for undeclared params ("string" streams,
+                       "loose" buffers and loose-parses — per-family legacy typing)
+    """
+
+    _ps_outer_open: str = ""
+    _ps_outer_close: str = ""
+    _ps_trim: str = "\n"
+    _ps_trim_single: bool = False
+    _ps_missing_type: str = "string"
+
+    def _ps_reset(self) -> None:
+        self._ps_mode = "idle"
+        self._ps_key = ""
+        self._ps_lead = "{"
+        self._ps_emitted_any = False
+        self._ps_lead_trimmed = False
+        self._ps_param_config: Dict = {}
+
+    def _ps_convert_value(self, key: str, raw: str) -> Any:
+        if key in self._ps_param_config or self._ps_missing_type != "loose":
+            return self._convert_param_value(raw, key, self._ps_param_config, "")
+        return _parse_loose_json_value(raw)
+
+    def _ps_trim_leading(self, text: str) -> str:
+        if self._ps_trim_single:
+            return text[1:] if text[:1] and text[:1] in self._ps_trim else text
+        return text.lstrip(self._ps_trim)
+
+    def _ps_trim_trailing(self, text: str) -> str:
+        if self._ps_trim_single:
+            return text[:-1] if text[-1:] and text[-1:] in self._ps_trim else text
+        return text.rstrip(self._ps_trim)
+
+    def parse_streaming_increment(self, new_text: str, tools: List[Tool]) -> StreamingParseResult:
+        self._buffer += new_text
+        if not hasattr(self, "_tool_indices"):
+            self._tool_indices = self._get_tool_indices(tools)
+        if not hasattr(self, "_ps_mode"):
+            self._ps_reset()
+
+        normal_parts: List[str] = []
+        calls: List[ToolCallItem] = []
+
+        def _emit(fragment: str) -> None:
+            if fragment:
+                self.streamed_args_for_tool[self.current_tool_id] += fragment
+                calls.append(
+                    ToolCallItem(tool_index=self.current_tool_id, name=None, parameters=fragment)
+                )
+
+        def _update_prev() -> None:
+            ledger = self.streamed_args_for_tool[self.current_tool_id]
+            for probe in (ledger, ledger + "}"):
+                try:
+                    parsed = json.loads(probe)
+                except (json.JSONDecodeError, ValueError):
+                    continue
+                if isinstance(parsed, dict):
+                    self.prev_tool_call_arr[self.current_tool_id]["arguments"] = parsed
+                return
+
+        while True:
+            buf = self._buffer
+            if not buf:
+                break
+            mode = self._ps_mode
+
+            if mode == "idle":
+                if calls:
+                    break  # text after a call defers to the next step (wire order)
+                pos = buf.find(self._ps_outer_open)
+                if pos == -1:
+                    hold = self._ends_with_partial_token(buf, self._ps_outer_open)
+                    release = buf[: len(buf) - hold] if hold else buf
+                    if release:
+                        normal_parts.append(release)
+                        self._buffer = buf[len(release):]
+                    break
+                if pos > 0:
+                    normal_parts.append(buf[:pos])
+                    self._buffer = buf[pos:]
+                    continue
+                self._buffer = buf[len(self._ps_outer_open):]
+                self._ps_mode = "block"
+                continue
+
+            if mode == "block":
+                inv = buf.find(self._ps_invoke_open_prefix)
+                close = buf.find(self._ps_outer_close) if self._ps_outer_close else -1
+                if close != -1 and (inv == -1 or close < inv):
+                    self._buffer = buf[close + len(self._ps_outer_close):]
+                    self._ps_mode = "idle"
+                    continue
+                if inv != -1:
+                    m = self._ps_invoke_open_re.search(buf, inv)
+                    if m is None:
+                        break  # invoke tag still streaming
+                    func_name = m.group(1).strip()
+                    if self.current_tool_id == -1:
+                        self.current_tool_id = 0
+                    while len(self.prev_tool_call_arr) <= self.current_tool_id:
+                        self.prev_tool_call_arr.append({})
+                    while len(self.streamed_args_for_tool) <= self.current_tool_id:
+                        self.streamed_args_for_tool.append("")
+                    self._buffer = buf[m.end():]
+                    if func_name in self._tool_indices or _should_forward_unknown_tool(func_name):
+                        calls.append(
+                            ToolCallItem(
+                                tool_index=self.current_tool_id, name=func_name, parameters=""
+                            )
+                        )
+                        self.prev_tool_call_arr[self.current_tool_id] = {
+                            "name": func_name,
+                            "arguments": {},
+                        }
+                        self._args_started = False
+                        self._ps_param_config = self._get_param_config(func_name, tools)
+                        self._ps_mode = "invoke"
+                    else:
+                        logger.warning(f"Model attempted to call undefined function: {func_name}")
+                        self._ps_mode = "invoke_skip"
+                    continue
+                hold = max(
+                    self._ends_with_partial_token(buf, self._ps_invoke_open_prefix),
+                    self._ends_with_partial_token(buf, self._ps_outer_close)
+                    if self._ps_outer_close
+                    else 0,
+                )
+                if len(buf) - hold > 0:
+                    self._buffer = buf[len(buf) - hold:]  # inter-invoke whitespace
+                break
+
+            if mode in ("invoke", "invoke_skip"):
+                p = buf.find(self._ps_param_open_prefix)
+                e = buf.find(self._ps_invoke_close)
+                if e != -1 and (p == -1 or e < p):
+                    if mode == "invoke":
+                        _emit("}" if self._args_started else "{}")
+                        _update_prev()
+                        self.current_tool_id += 1
+                        while len(self.streamed_args_for_tool) <= self.current_tool_id:
+                            self.streamed_args_for_tool.append("")
+                    self._buffer = buf[e + len(self._ps_invoke_close):]
+                    self._ps_mode = "block"
+                    continue
+                if p != -1:
+                    m = self._ps_param_open_re.search(buf, p)
+                    if m is None:
+                        break  # parameter tag still streaming
+                    self._buffer = buf[m.end():]
+                    if mode == "invoke_skip":
+                        self._ps_mode = "pskip"
+                        continue
+                    self._ps_key = m.group(1).strip()
+                    lead = "{" if not self._args_started else ","
+                    self._args_started = True
+                    ptype = self._schema_param_type(
+                        self._ps_key, self._ps_param_config, self._ps_missing_type
+                    )
+                    if ptype in ("string", "str", "enum"):
+                        _emit(lead + json.dumps(self._ps_key, ensure_ascii=False) + ':"')
+                        self._ps_emitted_any = False
+                        self._ps_lead_trimmed = False
+                        self._ps_mode = "pstr"
+                    else:
+                        self._ps_lead = lead
+                        self._ps_mode = "pbuf"
+                    continue
+                hold = max(
+                    self._ends_with_partial_token(buf, self._ps_param_open_prefix),
+                    self._ends_with_partial_token(buf, self._ps_invoke_close),
+                )
+                if len(buf) - hold > 0:
+                    self._buffer = buf[len(buf) - hold:]  # whitespace between parameters
+                break
+
+            if mode == "pstr":
+                if not self._ps_lead_trimmed:
+                    trimmed = self._ps_trim_leading(buf)
+                    if trimmed != buf:
+                        self._buffer = trimmed
+                        if self._ps_trim_single or trimmed:
+                            self._ps_lead_trimmed = bool(trimmed) or self._ps_trim_single
+                        continue
+                    if buf:
+                        self._ps_lead_trimmed = True
+                end = buf.find(self._ps_param_close)
+                if end == -1:
+                    hold = self._ends_with_partial_token(buf, self._ps_param_close)
+                    safe = buf[: len(buf) - hold] if hold else buf
+                    keep = len(safe) - len(safe.rstrip(self._ps_trim))
+                    emit_now = safe[: len(safe) - keep]
+                    if emit_now:
+                        _emit(self._json_escape_chunk(emit_now))
+                        self._ps_emitted_any = True
+                        self._buffer = buf[len(emit_now):]
+                    break
+                tail = self._ps_trim_trailing(buf[:end])
+                _emit(self._json_escape_chunk(tail) + '"')
+                _update_prev()
+                self._buffer = buf[end + len(self._ps_param_close):]
+                self._ps_mode = "invoke"
+                continue
+
+            if mode in ("pbuf", "pskip"):
+                end = buf.find(self._ps_param_close)
+                if end == -1:
+                    break  # hold the whole value until the parameter closes
+                if mode == "pbuf":
+                    raw = self._ps_trim_trailing(self._ps_trim_leading(buf[:end]))
+                    converted = self._ps_convert_value(self._ps_key, raw)
+                    _emit(
+                        self._ps_lead
+                        + json.dumps(self._ps_key, ensure_ascii=False)
+                        + ":"
+                        + json.dumps(converted, ensure_ascii=False)
+                    )
+                    _update_prev()
+                self._buffer = buf[end + len(self._ps_param_close):]
+                self._ps_mode = "invoke" if mode == "pbuf" else "invoke_skip"
+                continue
+
+        return StreamingParseResult(normal_text="".join(normal_parts), calls=calls)
+
+    def finish_streaming(self) -> str:
+        residual, self._buffer = self._buffer, ""
+        mode = getattr(self, "_ps_mode", "idle")
+        self._ps_reset()
+        if mode != "idle" or (self._ps_outer_open and self._ps_outer_open in residual):
+            return ""
+        if self.prev_tool_call_arr and residual.strip() == "":
+            return ""
+        return residual
+
+
+class Qwen25Detector(BaseFormatDetector):
+    """
+    Detector for Qwen 2.5 and Qwen 3 model function call format.
+
+    Format Structure:
+    ```
+    <tool_call>\n{"name":"func1", "arguments":{...}}\n
+    </tool_call>\n<tool_call>\n{"name":"func2", "arguments":{...}}\n</tool_call>
+    ```
+
+    Key Components:
+    - Tool Call Tags: `<tool_call>` and `</tool_call>` wrap each individual call
+    - Function Call Object: JSON object with "name" and "arguments" fields
+
+    Reference: https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct?chat_template=default
+    """
+
+    def __init__(self):
+        """
+        Initializes the detector with necessary state variables.
+        """
+        super().__init__()
+        self.bot_token = "<tool_call>"
+        self.eot_token = "</tool_call>"
+        self.tool_call_separator = "\n"
+        self._normal_text_buffer = ""  # Buffer for handling partial end tokens
+
+    def has_tool_call(self, text: str) -> bool:
+        """Check if the text contains a Qwen 2.5 format tool call."""
+        return self.bot_token in text
+
+    def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
+        """
+        One-time parsing: Detects and parses tool calls in the provided text.
+
+        :param text: The complete text to parse.
+        :param tools: List of available tools.
+        :return: ParseResult indicating success or failure, consumed text, leftover text, and parsed calls.
+        """
+        idx = text.find(self.bot_token)
+        normal_text = text[:idx].strip() if idx != -1 else text
+        if self.bot_token not in text:
+            return StreamingParseResult(normal_text=normal_text, calls=[])
+
+        # Find all <tool_call>\n...\n</tool_call> blocks
+        pattern = rf"{re.escape(self.bot_token)}(.*?){re.escape(self.eot_token)}"
+        match_result_list = re.findall(pattern, text, re.DOTALL)
+        calls = []
+        for match_result in match_result_list:
+            try:
+                parsed_call = json.loads(match_result.strip())
+                calls.extend(self.parse_base_json(parsed_call, tools))
+            except json.JSONDecodeError as e:
+                logger.warning(f"Failed to parse JSON part: {match_result}, JSON parse error: {str(e)}")
+                continue
+        return StreamingParseResult(normal_text=normal_text, calls=calls)
+
+    def parse_streaming_increment(self, new_text: str, tools: List[Tool]) -> StreamingParseResult:
+        """
+        Streaming incremental parsing for Qwen 2.5 tool calls.
+        Uses base class implementation with buffering to handle partial end tokens.
+        """
+        result = super().parse_streaming_increment(new_text, tools)
+
+        # Handle partial end tokens that are streamed character by character
+        if result.normal_text:
+            self._normal_text_buffer += result.normal_text
+
+            # Check if buffer contains complete end token (without leading newline)
+            end_token_without_newline = self.eot_token  # "</tool_call>"
+            if end_token_without_newline in self._normal_text_buffer:
+                cleaned_text = self._normal_text_buffer.replace(end_token_without_newline, "")
+                self._normal_text_buffer = ""
+                result.normal_text = cleaned_text
+            else:
+                # Check if buffer might contain partial end token at the end
+                partial_match_len = self._ends_with_partial_token(self._normal_text_buffer, end_token_without_newline)
+
+                if partial_match_len:
+                    # Keep potential partial match in buffer, return the rest
+                    result.normal_text = self._normal_text_buffer[:-partial_match_len]
+                    self._normal_text_buffer = self._normal_text_buffer[-partial_match_len:]
+                else:
+                    # No partial match, return all buffered text
+                    result.normal_text = self._normal_text_buffer
+                    self._normal_text_buffer = ""
+
+        return result
+
+    def finish_streaming(self) -> str:
+        residual = super().finish_streaming()
+        held, self._normal_text_buffer = self._normal_text_buffer, ""
+        return held + residual
+
+
+class MistralDetector(BaseFormatDetector):
+    """
+    Detector for Mistral model function call format.
+
+    The Mistral format uses a simple bracket-delimited structure with JSON arrays
+    containing function call objects.
+
+    Format Structure:
+    ```
+    [TOOL_CALLS] [{"name": "function_name", "arguments": {json_args}}, ...]
+    ```
+
+    Reference: https://huggingface.co/mistralai/Mistral-7B-Instruct-v0.3?chat_template=default
+    """
+
+    def __init__(self):
+        """
+        Initializes the detector with necessary state variables.
+        """
+        super().__init__()
+        self.bot_token = "[TOOL_CALLS] ["
+        self.eot_token = "]"
+        self.tool_call_regex = re.compile(r"\[{.*}\]", re.DOTALL)
+        self.tool_call_separator = ", "
+
+    def has_tool_call(self, text: str) -> bool:
+        """Check if the text contains a Mistral format tool call."""
+        return self.bot_token in text
+
+    def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
+        """
+        One-time parsing: Detects and parses tool calls in the provided text.
+
+        :param text: The complete text to parse.
+        :param tools: List of available tools.
+        :return: ParseResult indicating success or failure, consumed text, leftover text, and parsed calls.
+        """
+        idx = text.find(self.bot_token)
+        normal_text = text[:idx].strip() if idx != -1 else text
+
+        if self.bot_token not in text:
+            return StreamingParseResult(normal_text=normal_text, calls=[])
+
+        # Extract the JSON array part from [TOOL_CALLS] [...]
+        # Use bracket counting to properly handle nested brackets in JSON content
+        json_array_str = self._extract_json_array(text)
+        if not json_array_str:
+            return StreamingParseResult(normal_text=normal_text, calls=[])
+
+        calls = []
+        try:
+            function_call_arr = json.loads(json_array_str)
+            # Handle both single object and array of objects
+            if not isinstance(function_call_arr, list):
+                function_call_arr = [function_call_arr]
+            calls = self.parse_base_json(function_call_arr, tools)
+        except json.JSONDecodeError as e:
+            logger.warning(f"Failed to parse JSON part: {json_array_str}, JSON parse error: {str(e)}")
+
+        return StreamingParseResult(normal_text=normal_text, calls=calls)
+
+    def _extract_json_array(self, text: str) -> str:
+        """
+        Extract the JSON array part using bracket counting to handle nested brackets.
+
+        :param text: The complete text containing [TOOL_CALLS] [...]
+        :return: The JSON array string or None if not found
+        """
+        start_idx = text.find(self.bot_token)
+        if start_idx == -1:
+            return None
+
+        # Start from the opening bracket after [TOOL_CALLS]
+        json_start = start_idx + len(self.bot_token) - 1  # -1 to include the opening bracket
+        bracket_count = 0
+        in_string = False
+        escape_next = False
+
+        for i in range(json_start, len(text)):
+            char = text[i]
+
+            if escape_next:
+                escape_next = False
+                continue
+
+            if char == "\\":
+                escape_next = True
+                continue
+
+            if char == '"' and not escape_next:
+                in_string = not in_string
+                continue
+
+            if not in_string:
+                if char == "[":
+                    bracket_count += 1
+                elif char == "]":
+                    bracket_count -= 1
+                    if bracket_count == 0:
+                        return text[json_start : i + 1]
+
+        return None
+
+
+class Llama32Detector(BaseFormatDetector):
+    """
+    Detector for Llama 3.2 models with json tool call format.
+
+    Format Structure:
+    ```
+    <python_tag>{"name":"xxx", "arguments":{...}}
+    ```
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.bot_token = "<|python_tag|>"
+        # NOTE: technically Llama3.2 doesn't support well with parallel tool calls
+        # They need specific prompt engineering to support parallel tool calls
+        # Here we use ';' as the separator, which might have compatibility issues
+        # if users define to use a different separator in their prompt
+        self.tool_call_separator = ";"
+
+    def has_tool_call(self, text: str) -> bool:
+        """Check if the text contains a Llama 3.2 format tool call."""
+        # depending on the prompt format the Llama model may or may not
+        # prefix the output with the <|python_tag|> token
+        return "<|python_tag|>" in text or text.startswith("{")
+
+    def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
+        """Parse function calls from text, handling multiple JSON objects."""
+        if "<|python_tag|>" not in text and not text.startswith("{"):
+            return StreamingParseResult(normal_text=text, calls=[])
+
+        if "<|python_tag|>" in text:
+            normal_text, action_text = text.split("<|python_tag|>", maxsplit=1)
+        else:
+            normal_text, action_text = "", text
+
+        decoder = json.JSONDecoder()
+        idx = 0
+        safe_idx = idx  # the index of the last valid JSON object
+        all_actions = []
+        action_text_len = len(action_text)
+        while idx < action_text_len:
+            try:
+                obj, end = decoder.raw_decode(action_text[idx:])
+                all_actions.append(obj)
+                idx += end + len(self.tool_call_separator)
+                safe_idx = idx
+            except json.JSONDecodeError as e:
+                # Find where next `{"name"` appears and try again
+                logger.warning(f"Failed to parse JSON part: {action_text[idx:]}, JSON parse error: {str(e)}")
+                next_obj_start = action_text.find('{"name":', idx + 1)
+                if next_obj_start == -1:
+                    break
+                idx = next_obj_start
+                continue
+
+        # Only process if we found valid JSON objects
+        calls = self.parse_base_json(all_actions, tools) if all_actions else []
+        # Use safe_idx to avoid idx containing the last part of an invalid JSON object
+        trailing_text = action_text[safe_idx:].strip() if safe_idx < action_text_len else ""
+        return StreamingParseResult(normal_text=normal_text + trailing_text, calls=calls)
+
+
+
+
+
+class Glm47Detector(BaseFormatDetector):
+    """
+    Detector for GLM-4.7/GLM-4.7-Flash model function call format.
+
+    The GLM-4.7 format uses an XML-style envelope with arg_key/arg_value pairs
+    instead of JSON arguments.
+
+    Format Structure:
+    ```
+    <tool_call>function_name
+    <arg_key>param1</arg_key>
+    <arg_value>value1</arg_value>
+    <arg_key>param2</arg_key>
+    <arg_value>value2</arg_value>
+    </tool_call>
+    ```
+
+    Example:
+    ```
+    <tool_call>tool_brave_web_search_post
+    <arg_key>query</arg_key>
+    <arg_value>test search</arg_value>
+    <arg_key>count</arg_key>
+    <arg_value>5</arg_value>
+    </tool_call>
+    ```
+
+    Key Components:
+    - Tool Call Tags: `<tool_call>` and `</tool_call>` wrap each individual call
+    - Function Name: Appears on the first line after `<tool_call>`
+    - Arguments: Pairs of `<arg_key>name</arg_key>` and `<arg_value>value</arg_value>`
+
+    Reference: https://github.com/vllm-project/vllm/blob/main/vllm/tool_parsers/glm4_moe_tool_parser.py
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.bot_token = "<tool_call>"
+        self.eot_token = "</tool_call>"
+        self.tool_call_separator = "\n"
+
+        # Regex patterns for parsing GLM-4.7 tool calls
+        # Match complete tool call blocks
+        self.func_call_regex = re.compile(r"<tool_call>.*?</tool_call>", re.DOTALL)
+        # Extract function name and arguments from a tool call block
+        # Function name can be followed by newline OR directly by <arg_key>
+        # Pattern: <tool_call>function_name(\n|<arg_key>)...
+        self.func_detail_regex = re.compile(
+            r"<tool_call>([^<\n]+?)(?:\n|(?=<arg_key>)|(?=</tool_call>))(.*?)</tool_call>", re.DOTALL
+        )
+        # Extract arg_key/arg_value pairs
+        self.func_arg_regex = re.compile(r"<arg_key>(.*?)</arg_key>\s*<arg_value>(.*?)</arg_value>", re.DOTALL)
+
+        self._last_arguments = ""
+        self._normal_text_buffer = ""
+
+    def has_tool_call(self, text: str) -> bool:
+        """Check if the text contains a GLM-4.7 format tool call."""
+        return self.bot_token in text
+
+    def _parse_xml_arguments(self, arg_text: str, param_config: Dict | None = None, func_name: str = "") -> dict:
+        """
+        Parse XML-style arguments into a dictionary.
+
+        Args:
+            arg_text: The text containing <arg_key>/<arg_value> pairs
+
+        Returns:
+            Dictionary of argument name to value
+        """
+        if not arg_text:
+            return {}
+
+        args = {}
+        matches = self.func_arg_regex.findall(arg_text)
+        for key, value in matches:
+            key = key.strip()
+            value = value.strip()
+            if param_config and key in param_config:
+                # Schema-first: the declared type wins (a string-typed "5" stays "5").
+                args[key] = self._convert_param_value(value, key, param_config, func_name)
+                continue
+            # Undeclared parameter: legacy loose typing.
+            try:
+                parsed_value = json.loads(value)
+                args[key] = parsed_value
+            except (json.JSONDecodeError, ValueError):
+                args[key] = value
+        return args
+
+    def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
+        """
+        One-time parsing: Detects and parses tool calls in the provided text.
+
+        :param text: The complete text to parse.
+        :param tools: List of available tools.
+        :return: StreamingParseResult with normal_text and parsed calls.
+        """
+        idx = text.find(self.bot_token)
+        normal_text = text[:idx].strip() if idx != -1 else text
+
+        if self.bot_token not in text:
+            return StreamingParseResult(normal_text=normal_text, calls=[])
+
+        tool_indices = self._get_tool_indices(tools)
+        calls = []
+
+        # Find all <tool_call>...</tool_call> blocks
+        match_result_list = self.func_call_regex.findall(text)
+
+        for match_result in match_result_list:
+            try:
+                # Extract function name and arguments
+                func_detail = self.func_detail_regex.search(match_result)
+                if not func_detail:
+                    logger.warning(f"Failed to parse GLM-4.7 tool call: {match_result}")
+                    continue
+
+                func_name = func_detail.group(1).strip()
+                arg_text = func_detail.group(2) if func_detail.group(2) else ""
+
+                # Validate function name
+                if func_name not in tool_indices and not _should_forward_unknown_tool(func_name):
+                    logger.warning(f"Model attempted to call undefined function: {func_name}")
+                    continue
+
+                # Parse XML arguments to JSON (schema-first typing, loose fallback)
+                func_args = self._parse_xml_arguments(
+                    arg_text, self._get_param_config(func_name, tools), func_name
+                )
+
+                calls.append(
+                    ToolCallItem(
+                        tool_index=tool_indices.get(func_name, len(calls)),
+                        name=func_name,
+                        parameters=json.dumps(func_args, ensure_ascii=False),
+                    )
+                )
+            except Exception as e:
+                logger.warning(f"Failed to parse GLM-4.7 tool call: {match_result}, error: {str(e)}")
+                continue
+
+        return StreamingParseResult(normal_text=normal_text, calls=calls)
+
+    _G_KEY_OPEN = "<arg_key>"
+    _G_KEY_CLOSE = "</arg_key>"
+    _G_VAL_OPEN = "<arg_value>"
+    _G_VAL_CLOSE = "</arg_value>"
+
+    def _g_reset(self) -> None:
+        self._g_mode = "idle"  # idle|name|invoke|invoke_skip|key|key_skip|preval|preval_skip|pstr|pbuf|pskip
+        self._g_key = ""
+        self._g_lead = "{"
+        self._g_config: Dict = {}
+        self._g_lead_trimmed = False
+
+    def parse_streaming_increment(self, new_text: str, tools: List[Tool]) -> StreamingParseResult:
+        """Value-level streaming for GLM-4.7: text outside blocks streams live;
+        string-typed <arg_value> content streams char-by-char as JSON-escaped
+        prefix-stable fragments; typed values buffer until the value closes."""
+        self._buffer += new_text
+        if not hasattr(self, "_tool_indices"):
+            self._tool_indices = self._get_tool_indices(tools)
+        if not hasattr(self, "_g_mode"):
+            self._g_reset()
+
+        normal_parts: List[str] = []
+        calls: List[ToolCallItem] = []
+
+        def _emit(fragment: str) -> None:
+            if fragment:
+                self.streamed_args_for_tool[self.current_tool_id] += fragment
+                calls.append(
+                    ToolCallItem(tool_index=self.current_tool_id, name=None, parameters=fragment)
+                )
+
+        def _update_prev() -> None:
+            ledger = self.streamed_args_for_tool[self.current_tool_id]
+            for probe in (ledger, ledger + "}"):
+                try:
+                    parsed = json.loads(probe)
+                except (json.JSONDecodeError, ValueError):
+                    continue
+                if isinstance(parsed, dict):
+                    self.prev_tool_call_arr[self.current_tool_id]["arguments"] = parsed
+                return
+
+        while True:
+            buf = self._buffer
+            if not buf:
+                break
+            mode = self._g_mode
+
+            if mode == "idle":
+                if calls:
+                    break  # text after a call defers to the next step (wire order)
+                pos = buf.find(self.bot_token)
+                if pos == -1:
+                    hold = self._ends_with_partial_token(buf, self.bot_token)
+                    release = buf[: len(buf) - hold] if hold else buf
+                    if release:
+                        normal_parts.append(release)
+                        self._buffer = buf[len(release):]
+                    break
+                if pos > 0:
+                    normal_parts.append(buf[:pos])
+                    self._buffer = buf[pos:]
+                    continue
+                self._buffer = buf[len(self.bot_token):]
+                self._g_mode = "name"
+                continue
+
+            if mode == "name":
+                # The function name runs until a newline, the first <arg_key>, or
+                # the closing tag (whichever comes first).
+                ends = [p for p in (buf.find("\n"), buf.find(self._G_KEY_OPEN), buf.find(self.eot_token)) if p != -1]
+                if not ends:
+                    break  # name still streaming (names are short — hold)
+                cut = min(ends)
+                func_name = buf[:cut].strip()
+                self._buffer = buf[cut + 1:] if buf[cut] == "\n" else buf[cut:]
+                if self.current_tool_id == -1:
+                    self.current_tool_id = 0
+                while len(self.prev_tool_call_arr) <= self.current_tool_id:
+                    self.prev_tool_call_arr.append({})
+                while len(self.streamed_args_for_tool) <= self.current_tool_id:
+                    self.streamed_args_for_tool.append("")
+                if func_name and (
+                    func_name in self._tool_indices or _should_forward_unknown_tool(func_name)
+                ):
+                    calls.append(
+                        ToolCallItem(tool_index=self.current_tool_id, name=func_name, parameters="")
+                    )
+                    self.prev_tool_call_arr[self.current_tool_id] = {
+                        "name": func_name,
+                        "arguments": {},
+                    }
+                    self._args_started = False
+                    self._g_config = self._get_param_config(func_name, tools)
+                    self._g_mode = "invoke"
+                else:
+                    logger.warning(f"Model attempted to call undefined function: {func_name}")
+                    self._g_mode = "invoke_skip"
+                continue
+
+            if mode in ("invoke", "invoke_skip"):
+                k = buf.find(self._G_KEY_OPEN)
+                e = buf.find(self.eot_token)
+                if e != -1 and (k == -1 or e < k):
+                    if mode == "invoke":
+                        _emit("}" if self._args_started else "{}")
+                        _update_prev()
+                        self.current_tool_id += 1
+                        while len(self.streamed_args_for_tool) <= self.current_tool_id:
+                            self.streamed_args_for_tool.append("")
+                    self._buffer = buf[e + len(self.eot_token):]
+                    self._g_mode = "idle"
+                    continue
+                if k != -1:
+                    self._buffer = buf[k + len(self._G_KEY_OPEN):]
+                    self._g_mode = "key" if mode == "invoke" else "key_skip"
+                    continue
+                hold = max(
+                    self._ends_with_partial_token(buf, self._G_KEY_OPEN),
+                    self._ends_with_partial_token(buf, self.eot_token),
+                )
+                if len(buf) - hold > 0:
+                    self._buffer = buf[len(buf) - hold:]  # whitespace between elements
+                break
+
+            if mode in ("key", "key_skip"):
+                end = buf.find(self._G_KEY_CLOSE)
+                if end == -1:
+                    break  # keys are short — hold until complete
+                self._g_key = buf[:end].strip()
+                self._buffer = buf[end + len(self._G_KEY_CLOSE):]
+                self._g_mode = "preval" if mode == "key" else "preval_skip"
+                continue
+
+            if mode in ("preval", "preval_skip"):
+                v = buf.find(self._G_VAL_OPEN)
+                if v == -1:
+                    hold = self._ends_with_partial_token(buf, self._G_VAL_OPEN)
+                    if len(buf) - hold > 0:
+                        self._buffer = buf[len(buf) - hold:]  # whitespace between key and value
+                    break
+                self._buffer = buf[v + len(self._G_VAL_OPEN):]
+                if mode == "preval_skip":
+                    self._g_mode = "pskip"
+                    continue
+                lead = "{" if not self._args_started else ","
+                self._args_started = True
+                ptype = self._schema_param_type(self._g_key, self._g_config, "loose")
+                if ptype in ("string", "str", "enum"):
+                    _emit(lead + json.dumps(self._g_key, ensure_ascii=False) + ':"')
+                    self._g_lead_trimmed = False
+                    self._g_mode = "pstr"
+                else:
+                    self._g_lead = lead
+                    self._g_mode = "pbuf"
+                continue
+
+            if mode == "pstr":
+                if not self._g_lead_trimmed:
+                    trimmed = buf.lstrip()
+                    if trimmed != buf:
+                        self._buffer = trimmed
+                        continue
+                    self._g_lead_trimmed = True
+                end = buf.find(self._G_VAL_CLOSE)
+                if end == -1:
+                    hold = self._ends_with_partial_token(buf, self._G_VAL_CLOSE)
+                    safe = buf[: len(buf) - hold] if hold else buf
+                    keep = len(safe) - len(safe.rstrip())
+                    emit_now = safe[: len(safe) - keep]
+                    if emit_now:
+                        _emit(self._json_escape_chunk(emit_now))
+                        self._buffer = buf[len(emit_now):]
+                    break
+                tail = buf[:end].rstrip()
+                _emit(self._json_escape_chunk(tail) + '"')
+                _update_prev()
+                self._buffer = buf[end + len(self._G_VAL_CLOSE):]
+                self._g_mode = "invoke"
+                continue
+
+            if mode in ("pbuf", "pskip"):
+                end = buf.find(self._G_VAL_CLOSE)
+                if end == -1:
+                    break  # hold the whole value until it closes
+                if mode == "pbuf":
+                    raw = buf[:end].strip()
+                    if self._g_key in self._g_config:
+                        converted = self._convert_param_value(raw, self._g_key, self._g_config, "")
+                    else:
+                        try:
+                            converted = json.loads(raw)
+                        except (json.JSONDecodeError, ValueError):
+                            converted = raw
+                    _emit(
+                        self._g_lead
+                        + json.dumps(self._g_key, ensure_ascii=False)
+                        + ":"
+                        + json.dumps(converted, ensure_ascii=False)
+                    )
+                    _update_prev()
+                self._buffer = buf[end + len(self._G_VAL_CLOSE):]
+                self._g_mode = "invoke" if mode == "pbuf" else "invoke_skip"
+                continue
+
+        return StreamingParseResult(normal_text="".join(normal_parts), calls=calls)
+
+    def finish_streaming(self) -> str:
+        residual, self._buffer = self._buffer, ""
+        mode = getattr(self, "_g_mode", "idle")
+        self._g_reset()
+        if mode != "idle" or self.bot_token in residual:
+            return ""
+        if self.eot_token in residual:
+            residual = residual.replace(self.eot_token, "")
+        if self.prev_tool_call_arr and residual.strip() == "":
+            return ""
+        return residual
+
+
+class DeepSeekV32Detector(BaseFormatDetector):
+    """
+    Detector for DeepSeek V3.2 model function call format using DSML
+    (DeepSeek Markup Language).
+
+    Format Structure:
+    ```
+    <｜DSML｜function_calls>
+    <｜DSML｜invoke name="get_weather">
+    <｜DSML｜parameter name="location" string="true">Hangzhou</｜DSML｜parameter>
+    <｜DSML｜parameter name="date" string="true">2024-01-16</｜DSML｜parameter>
+    </｜DSML｜invoke>
+    </｜DSML｜function_calls>
+    ```
+
+    Key Components:
+    - Function Calls Block: `<｜DSML｜function_calls>` ... `</｜DSML｜function_calls>`
+    - Individual Invocation: `<｜DSML｜invoke name="func">` ... `</｜DSML｜invoke>`
+    - Parameters: `<｜DSML｜parameter name="key" string="true|false">value</｜DSML｜parameter>`
+      - string="true": value is plain text (will be JSON-escaped)
+      - string="false": value is JSON (numbers, booleans, arrays, objects)
+    - Supports multiple parallel tool calls
+
+    Reference: https://huggingface.co/deepseek-ai/DeepSeek-V3.2
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.dsml_token = "｜DSML｜"
+        self.bot_token = f"<{self.dsml_token}function_calls>"
+        self.eot_token = f"</{self.dsml_token}function_calls>"
+        self.alt_bot_token = f"<{self.dsml_token}tool_calls>"
+        self.alt_eot_token = f"</{self.dsml_token}tool_calls>"
+        self.invoke_start_prefix = f"<{self.dsml_token}invoke"
+        self.invoke_end_token = f"</{self.dsml_token}invoke>"
+        self.param_end_token = f"</{self.dsml_token}parameter>"
+
+        # Regex for complete invoke extraction
+        _de = re.escape(self.dsml_token)
+        self.invoke_regex = re.compile(
+            rf'<{_de}invoke\s+name="([^"]+)"\s*>(.*?)</{_de}invoke>',
+            re.DOTALL,
+        )
+        # Regex for parameter extraction
+        self.param_regex = re.compile(
+            rf'<{_de}parameter\s+name="([^"]+)"(?:\s+string="(true|false)")?\s*>(.*?)</{_de}parameter>',
+            re.DOTALL,
+        )
+        # Regex for partial invoke (name known, body still streaming)
+        self.partial_invoke_regex = re.compile(
+            rf'<{_de}invoke\s+name="([^"]+)"\s*>(.*)',
+            re.DOTALL,
+        )
+        # Streaming state machine tag regexes (anchored matches over the buffer).
+        self.invoke_open_regex = re.compile(rf'<{_de}invoke\s+name="([^"]+)"\s*>')
+        self.param_open_regex = re.compile(
+            rf'<{_de}parameter\s+name="([^"]+)"(?:\s+string="(true|false)")?\s*>'
+        )
+
+        self._last_arguments = ""
+        self._accumulated_params: List[tuple] = []
+        self._in_function_calls = False  # Track if we're inside a function_calls block
+        # Streaming state machine (vLLM deepseekv32-parser style):
+        # idle | block | invoke | invoke_skip | pstr | pbuf | pskip
+        self._ds_mode = "idle"
+        self._args_started = False
+        self._param_name = ""
+        self._param_lead = "{"
+
+    def block_close_tokens(self) -> tuple:
+        return (self.eot_token, self.alt_eot_token)
+
+    def has_tool_call(self, text: str) -> bool:
+        return self.bot_token in text or self.alt_bot_token in text
+
+    def _param_fragment(self, index: int, name: str, is_str: str, value: str) -> str:
+        """Prefix-stable arguments fragment for one closed DSML parameter: the
+        object opener (or separator) plus ``"name": value``, serialized exactly as
+        json.dumps of the full dict would, so concatenated fragments + the closing
+        brace equal the final arguments JSON byte-for-byte."""
+        if is_str == "true":
+            parsed: Any = value
+        else:
+            try:
+                parsed = json.loads(value)
+            except (json.JSONDecodeError, ValueError):
+                parsed = value
+        lead = "{" if index == 0 else ", "
+        return (
+            lead
+            + json.dumps(name, ensure_ascii=False)
+            + ": "
+            + json.dumps(parsed, ensure_ascii=False)
+        )
+
+    def _dsml_params_to_json(self, params: List[tuple]) -> str:
+        """Convert DSML parameter tuples (name, is_str, value) to a JSON arguments string."""
+        args = {}
+        for name, is_str, value in params:
+            if is_str == "true":
+                args[name] = value
+            else:
+                try:
+                    args[name] = json.loads(value)
+                except (json.JSONDecodeError, ValueError):
+                    args[name] = value
+        return json.dumps(args, ensure_ascii=False)
+
+    def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
+        """One-time parsing for DSML format tool calls."""
+        idx = _first_existing_pos(text, [self.bot_token, self.alt_bot_token])
+        normal_text = text[:idx].strip() if idx != -1 else text
+        if idx == -1:
+            return StreamingParseResult(normal_text=normal_text, calls=[])
+
+        tool_indices = self._get_tool_indices(tools)
+        calls = []
+
+        invoke_matches = self.invoke_regex.findall(text)
+        for func_name, invoke_body in invoke_matches:
+            if func_name not in tool_indices and not _should_forward_unknown_tool(func_name):
+                logger.warning(f"Model attempted to call undefined function: {func_name}")
+                continue
+
+            param_matches = self.param_regex.findall(invoke_body)
+            args_json = self._dsml_params_to_json(param_matches)
+
+            calls.append(
+                ToolCallItem(
+                    tool_index=tool_indices.get(func_name, len(calls)),
+                    name=func_name,
+                    parameters=args_json,
+                )
+            )
+
+        return StreamingParseResult(normal_text=normal_text, calls=calls)
+
+    def parse_streaming_increment(self, new_text: str, tools: List[Tool]) -> StreamingParseResult:
+        """Streaming incremental parsing for DSML tool calls, modeled on vLLM's
+        deepseekv32 parser: text outside blocks streams live; ``string="true"``
+        parameter VALUES stream char-by-char as JSON-escaped, prefix-stable
+        argument fragments (``{"key":"`` at parameter open, escaped value chars,
+        ``"`` at close, ``}`` at invoke close); non-string values buffer until the
+        parameter closes because their JSON form needs the complete text."""
+        self._buffer += new_text
+        if not hasattr(self, "_tool_indices"):
+            self._tool_indices = self._get_tool_indices(tools)
+
+        normal_parts: List[str] = []
+        calls: List[ToolCallItem] = []
+        param_open_token = f"<{self.dsml_token}parameter"
+
+        def _emit_args(fragment: str) -> None:
+            if fragment:
+                self.streamed_args_for_tool[self.current_tool_id] += fragment
+                calls.append(
+                    ToolCallItem(
+                        tool_index=self.current_tool_id, name=None, parameters=fragment
+                    )
+                )
+
+        def _update_prev_args() -> None:
+            ledger = self.streamed_args_for_tool[self.current_tool_id]
+            for probe in (ledger, ledger + "}"):
+                try:
+                    parsed = json.loads(probe)
+                except (json.JSONDecodeError, ValueError):
+                    continue
+                if isinstance(parsed, dict):
+                    self.prev_tool_call_arr[self.current_tool_id]["arguments"] = parsed
+                return
+
+        while True:
+            buf = self._buffer
+            if not buf:
+                break
+
+            if self._ds_mode == "idle":
+                if calls:
+                    break  # text after a call defers to the next step (wire order)
+                pos = _first_existing_pos(buf, [self.bot_token, self.alt_bot_token])
+                if pos == -1:
+                    hold = max(
+                        self._ends_with_partial_token(buf, self.bot_token),
+                        self._ends_with_partial_token(buf, self.alt_bot_token),
+                    )
+                    release = buf[: len(buf) - hold] if hold else buf
+                    if release:
+                        for e_token in (self.eot_token, self.alt_eot_token, self.invoke_end_token):
+                            if e_token in release:
+                                release = release.replace(e_token, "")
+                        if release:
+                            normal_parts.append(release)
+                        self._buffer = buf[len(buf) - hold:] if hold else ""
+                    break
+                if pos > 0:
+                    normal_parts.append(buf[:pos])
+                    self._buffer = buf[pos:]
+                    continue
+                opener = self.bot_token if buf.startswith(self.bot_token) else self.alt_bot_token
+                self._buffer = buf[len(opener):]
+                self._in_function_calls = True
+                self._ds_mode = "block"
+                continue
+
+            if self._ds_mode == "block":
+                inv = buf.find(self.invoke_start_prefix)
+                close = _first_existing_pos(buf, [self.eot_token, self.alt_eot_token])
+                if close != -1 and (inv == -1 or close < inv):
+                    matched = (
+                        self.eot_token
+                        if buf[close : close + len(self.eot_token)] == self.eot_token
+                        else self.alt_eot_token
+                    )
+                    self._buffer = buf[close + len(matched):]
+                    self._in_function_calls = False
+                    self._ds_mode = "idle"
+                    continue
+                if inv != -1:
+                    m = self.invoke_open_regex.search(buf, inv)
+                    if m is None:
+                        break  # invoke tag still streaming
+                    func_name = m.group(1)
+                    if self.current_tool_id == -1:
+                        self.current_tool_id = 0
+                    while len(self.prev_tool_call_arr) <= self.current_tool_id:
+                        self.prev_tool_call_arr.append({})
+                    while len(self.streamed_args_for_tool) <= self.current_tool_id:
+                        self.streamed_args_for_tool.append("")
+                    self._buffer = buf[m.end():]
+                    if func_name in self._tool_indices or _should_forward_unknown_tool(func_name):
+                        calls.append(
+                            ToolCallItem(
+                                tool_index=self.current_tool_id, name=func_name, parameters=""
+                            )
+                        )
+                        self.prev_tool_call_arr[self.current_tool_id] = {
+                            "name": func_name,
+                            "arguments": {},
+                        }
+                        self._args_started = False
+                        self._ds_mode = "invoke"
+                    else:
+                        logger.warning(f"Model attempted to call undefined function: {func_name}")
+                        self._ds_mode = "invoke_skip"
+                    continue
+                hold = max(
+                    self._ends_with_partial_token(buf, self.invoke_start_prefix),
+                    self._ends_with_partial_token(buf, self.eot_token),
+                    self._ends_with_partial_token(buf, self.alt_eot_token),
+                )
+                if len(buf) - hold > 0:
+                    self._buffer = buf[len(buf) - hold:]  # inter-invoke whitespace
+                break
+
+            if self._ds_mode in ("invoke", "invoke_skip"):
+                p = buf.find(param_open_token)
+                e = buf.find(self.invoke_end_token)
+                if e != -1 and (p == -1 or e < p):
+                    if self._ds_mode == "invoke":
+                        _emit_args("}" if self._args_started else "{}")
+                        _update_prev_args()
+                        self.current_tool_id += 1
+                        while len(self.streamed_args_for_tool) <= self.current_tool_id:
+                            self.streamed_args_for_tool.append("")
+                    self._buffer = buf[e + len(self.invoke_end_token):]
+                    self._ds_mode = "block"
+                    continue
+                if p != -1:
+                    m = self.param_open_regex.search(buf, p)
+                    if m is None:
+                        break  # parameter tag still streaming
+                    self._buffer = buf[m.end():]
+                    if self._ds_mode == "invoke_skip":
+                        self._ds_mode = "pskip"
+                        continue
+                    self._param_name = m.group(1)
+                    lead = "{" if not self._args_started else ","
+                    self._args_started = True
+                    if m.group(2) == "true":
+                        _emit_args(lead + json.dumps(self._param_name, ensure_ascii=False) + ':"')
+                        self._ds_mode = "pstr"
+                    else:
+                        self._param_lead = lead
+                        self._ds_mode = "pbuf"
+                    continue
+                hold = max(
+                    self._ends_with_partial_token(buf, param_open_token),
+                    self._ends_with_partial_token(buf, self.invoke_end_token),
+                )
+                if len(buf) - hold > 0:
+                    self._buffer = buf[len(buf) - hold:]  # whitespace between parameters
+                break
+
+            if self._ds_mode == "pstr":
+                end = buf.find(self.param_end_token)
+                if end == -1:
+                    hold = self._ends_with_partial_token(buf, self.param_end_token)
+                    emit_len = len(buf) - hold
+                    if emit_len > 0:
+                        _emit_args(json.dumps(buf[:emit_len], ensure_ascii=False)[1:-1])
+                        self._buffer = buf[emit_len:]
+                    break
+                _emit_args(json.dumps(buf[:end], ensure_ascii=False)[1:-1] + '"')
+                self._buffer = buf[end + len(self.param_end_token):]
+                _update_prev_args()
+                self._ds_mode = "invoke"
+                continue
+
+            if self._ds_mode in ("pbuf", "pskip"):
+                end = buf.find(self.param_end_token)
+                if end == -1:
+                    break  # hold the whole value until the parameter closes
+                if self._ds_mode == "pbuf":
+                    value = buf[:end]
+                    try:
+                        parsed: Any = json.loads(value)
+                    except (json.JSONDecodeError, ValueError):
+                        parsed = value
+                    _emit_args(
+                        self._param_lead
+                        + json.dumps(self._param_name, ensure_ascii=False)
+                        + ":"
+                        + json.dumps(parsed, ensure_ascii=False)
+                    )
+                    _update_prev_args()
+                self._buffer = buf[end + len(self.param_end_token):]
+                self._ds_mode = "invoke" if self._ds_mode == "pbuf" else "invoke_skip"
+                continue
+
+        return StreamingParseResult(normal_text="".join(normal_parts), calls=calls)
+
+    def finish_streaming(self) -> str:
+        residual, self._buffer = self._buffer, ""
+        mode, self._ds_mode = self._ds_mode, "idle"
+        self._in_function_calls = False
+        if mode != "idle" or self.has_tool_call(residual):
+            return ""
+        for e_token in (self.eot_token, self.alt_eot_token, self.invoke_end_token):
+            if e_token in residual:
+                residual = residual.replace(e_token, "")
+        if self.prev_tool_call_arr and residual.strip() == "":
+            return ""
+        return residual
+
+
+class Qwen3CoderDetector(InvokeParamStreamMixin, BaseFormatDetector):
+    _ps_trim = "\n"
+    _ps_trim_single = True
+    _ps_missing_type = "string"
+
+    """
+    Detector for Qwen3-Coder XML-style function call format.
+
+    Format Structure:
+    ```
+    <tool_call>
+    <function=function_name>
+    <parameter=param1>
+    value1
+    </parameter>
+    <parameter=param2>
+    value2
+    </parameter>
+    </function>
+    </tool_call>
+    ```
+
+    Key differences from Qwen25Detector (JSON-based):
+    - Parameters are XML key-value pairs, not JSON objects
+    - Function name is embedded in the <function=> tag attribute
+    - Values need schema-aware type conversion (string by default)
+
+    Reference: https://docs.vllm.ai/projects/recipes/en/latest/Qwen/Qwen3-Coder-480B-A35B.html
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.bot_token = "<tool_call>"
+        self.eot_token = "</tool_call>"
+        self.tool_call_separator = "\n"
+
+        # Regex patterns
+        self.tool_call_block_regex = re.compile(r"<tool_call>(.*?)</tool_call>", re.DOTALL)
+        self.function_regex = re.compile(r"<function=(.*?)</function>|<function=(.*)$", re.DOTALL)
+        self.parameter_regex = re.compile(
+            r"<parameter=(.*?)(?:</parameter>|(?=<parameter=)|(?=</function>)|$)", re.DOTALL
+        )
+        self._normal_text_buffer = ""
+
+        # InvokeParamStreamMixin grammar
+        self._ps_outer_open = "<tool_call>"
+        self._ps_outer_close = "</tool_call>"
+        self._ps_invoke_open_prefix = "<function="
+        self._ps_invoke_open_re = re.compile(r"<function=([^>]*)>")
+        self._ps_invoke_close = "</function>"
+        self._ps_param_open_prefix = "<parameter="
+        self._ps_param_open_re = re.compile(r"<parameter=([^>]*)>")
+        self._ps_param_close = "</parameter>"
+        self._ps_reset()
+
+    def has_tool_call(self, text: str) -> bool:
+        return "<function=" in text or self.bot_token in text
+
+
+    def _parse_function_call(self, function_str: str, tools: List[Tool]) -> Optional[ToolCallItem]:
+        """Parse a single <function=name>...</function> block into a ToolCallItem."""
+        try:
+            end_index = function_str.index(">")
+        except ValueError:
+            return None
+
+        func_name = function_str[:end_index].strip()
+        tool_indices = self._get_tool_indices(tools)
+        if func_name not in tool_indices and not _should_forward_unknown_tool(func_name):
+            logger.warning(f"Model attempted to call undefined function: {func_name}")
+            return None
+
+        parameters_text = function_str[end_index + 1 :]
+        param_config = self._get_param_config(func_name, tools)
+        param_dict = {}
+
+        for match in self.parameter_regex.findall(parameters_text):
+            try:
+                idx = match.index(">")
+            except ValueError:
+                continue
+            param_name = match[:idx].strip()
+            param_value = match[idx + 1 :]
+            # Strip leading/trailing newlines from value
+            if param_value.startswith("\n"):
+                param_value = param_value[1:]
+            if param_value.endswith("\n"):
+                param_value = param_value[:-1]
+
+            param_dict[param_name] = self._convert_param_value(param_value, param_name, param_config, func_name)
+
+        return ToolCallItem(
+            tool_index=tool_indices.get(func_name, 0),
+            name=func_name,
+            parameters=json.dumps(param_dict, ensure_ascii=False),
+        )
+
+    def _build_partial_arguments_json(self, func_name: str, partial_body: str, tools: List[Tool]) -> Optional[str]:
+        """Build the current argument JSON from a partial XML tool-call body."""
+        param_matches = self.parameter_regex.findall(partial_body)
+        if not param_matches:
+            return None
+
+        param_config = self._get_param_config(func_name, tools)
+        param_dict = {}
+        has_visible_value = False
+
+        for match in param_matches:
+            try:
+                idx = match.index(">")
+            except ValueError:
+                continue
+
+            param_name = match[:idx].strip()
+            param_value = match[idx + 1 :]
+            if param_value.startswith("\n"):
+                param_value = param_value[1:]
+            if param_value.endswith("\n"):
+                param_value = param_value[:-1]
+
+            if param_value.strip():
+                has_visible_value = True
+            elif (
+                f"<parameter={param_name}>" in partial_body
+                and f"<parameter={param_name}>{param_value}</parameter>" in partial_body
+            ):
+                # Closed empty-string parameter. We can safely emit it.
+                has_visible_value = True
+            else:
+                # Parameter tag is present but its value has not started streaming yet.
+                continue
+
+            param_dict[param_name] = self._convert_param_value(param_value, param_name, param_config, func_name)
+
+        if not param_dict and not has_visible_value:
+            return None
+
+        return json.dumps(param_dict, ensure_ascii=False)
+
+    def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
+        idx = text.find(self.bot_token)
+        normal_text = text[:idx].strip() if idx != -1 else text
+
+        if "<function=" not in text:
+            return StreamingParseResult(normal_text=normal_text, calls=[])
+
+        # Extract function blocks from tool_call blocks (or raw text as fallback)
+        tool_call_blocks = self.tool_call_block_regex.findall(text)
+        if not tool_call_blocks:
+            tool_call_blocks = [text]
+
+        calls = []
+        for block in tool_call_blocks:
+            func_matches = self.function_regex.findall(block)
+            for match in func_matches:
+                func_str = match[0] if match[0] else match[1]
+                item = self._parse_function_call(func_str, tools)
+                if item:
+                    item.tool_index = len(calls)
+                    calls.append(item)
+
+        return StreamingParseResult(normal_text=normal_text, calls=calls)
+
+
+class Gemma4Detector(BaseFormatDetector):
+    """FreeToken serving adapter for Gemma4's compact tool-call format."""
+
+    def __init__(self):
+        super().__init__()
+        self.bot_token = "<|tool_call>"
+        self.eot_token = "<tool_call|>"
+        self.call_regex = re.compile(
+            r"<\|tool_call>\s*call:([A-Za-z_][\w.:-]*)\{(.*?)\}<tool_call\|>",
+            re.DOTALL,
+        )
+
+    def has_tool_call(self, text: str) -> bool:
+        return self.bot_token in text
+
+    def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
+        idx = text.find(self.bot_token)
+        normal_text = text[:idx].strip() if idx != -1 else text
+        if idx == -1:
+            return StreamingParseResult(normal_text=normal_text, calls=[])
+
+        tool_indices = self._get_tool_indices(tools)
+        calls: List[ToolCallItem] = []
+        for func_name, arg_text in self.call_regex.findall(text):
+            if func_name not in tool_indices and not _should_forward_unknown_tool(func_name):
+                logger.warning(f"Model attempted to call undefined function: {func_name}")
+                continue
+            calls.append(
+                ToolCallItem(
+                    tool_index=len(calls),
+                    name=func_name,
+                    parameters=json.dumps(_parse_gemma_call_args(arg_text), ensure_ascii=False),
+                )
+            )
+        return StreamingParseResult(normal_text=normal_text, calls=calls)
+
+    _G4_QUOTE = '<|"|>'
+
+    def _g4_reset(self) -> None:
+        self._g4_mode = "idle"  # idle|header|key|dispatch|pstr|vbuf|await_eot|swallow
+        self._g4_key = ""
+        self._g4_scanned = 0
+        self._g4_depth = 0
+        self._g4_in_str = False
+
+    def parse_streaming_increment(self, new_text: str, tools: List[Tool]) -> StreamingParseResult:
+        """Value-level streaming for Gemma4's compact call syntax: text outside
+        blocks streams live; ``<|"|>``-quoted string values stream char-by-char as
+        JSON-escaped prefix-stable fragments; unquoted values (numbers, booleans,
+        nested objects/arrays) buffer to their top-level ``,``/``}`` terminator and
+        are typed exactly like the non-streaming parser."""
+        self._buffer += new_text
+        if not hasattr(self, "_tool_indices"):
+            self._tool_indices = self._get_tool_indices(tools)
+        if not hasattr(self, "_g4_mode"):
+            self._g4_reset()
+
+        normal_parts: List[str] = []
+        calls: List[ToolCallItem] = []
+        Q = self._G4_QUOTE
+
+        def _emit(fragment: str) -> None:
+            if fragment:
+                self.streamed_args_for_tool[self.current_tool_id] += fragment
+                calls.append(
+                    ToolCallItem(tool_index=self.current_tool_id, name=None, parameters=fragment)
+                )
+
+        def _update_prev() -> None:
+            ledger = self.streamed_args_for_tool[self.current_tool_id]
+            for probe in (ledger, ledger + "}"):
+                try:
+                    parsed = json.loads(probe)
+                except (json.JSONDecodeError, ValueError):
+                    continue
+                if isinstance(parsed, dict):
+                    self.prev_tool_call_arr[self.current_tool_id]["arguments"] = parsed
+                return
+
+        while True:
+            buf = self._buffer
+            if not buf:
+                break
+            mode = self._g4_mode
+
+            if mode == "idle":
+                if calls:
+                    break  # text after a call defers to the next step (wire order)
+                pos = buf.find(self.bot_token)
+                if pos == -1:
+                    hold = self._ends_with_partial_token(buf, self.bot_token)
+                    release = buf[: len(buf) - hold] if hold else buf
+                    if release:
+                        normal_parts.append(release)
+                        self._buffer = buf[len(release):]
+                    break
+                if pos > 0:
+                    normal_parts.append(buf[:pos])
+                    self._buffer = buf[pos:]
+                    continue
+                self._buffer = buf[len(self.bot_token):]
+                self._g4_mode = "header"
+                continue
+
+            if mode == "header":
+                brace = buf.find("{")
+                if brace == -1:
+                    break  # header still streaming (short — hold)
+                header = buf[:brace].strip()
+                self._buffer = buf[brace + 1:]
+                func_name = header[len("call:"):].strip() if header.startswith("call:") else ""
+                if self.current_tool_id == -1:
+                    self.current_tool_id = 0
+                while len(self.prev_tool_call_arr) <= self.current_tool_id:
+                    self.prev_tool_call_arr.append({})
+                while len(self.streamed_args_for_tool) <= self.current_tool_id:
+                    self.streamed_args_for_tool.append("")
+                if func_name and (
+                    func_name in self._tool_indices or _should_forward_unknown_tool(func_name)
+                ):
+                    calls.append(
+                        ToolCallItem(tool_index=self.current_tool_id, name=func_name, parameters="")
+                    )
+                    self.prev_tool_call_arr[self.current_tool_id] = {
+                        "name": func_name,
+                        "arguments": {},
+                    }
+                    self._args_started = False
+                    self._g4_mode = "key"
+                else:
+                    logger.warning(f"Model attempted to call undefined function: {func_name!r}")
+                    self._g4_mode = "swallow"
+                continue
+
+            if mode == "key":
+                stripped = buf.lstrip()
+                if stripped != buf:
+                    self._buffer = stripped
+                    continue
+                if buf.startswith("}"):
+                    _emit("}" if self._args_started else "{}")
+                    _update_prev()
+                    self.current_tool_id += 1
+                    while len(self.streamed_args_for_tool) <= self.current_tool_id:
+                        self.streamed_args_for_tool.append("")
+                    self._buffer = buf[1:]
+                    self._g4_mode = "await_eot"
+                    continue
+                colon = buf.find(":")
+                if colon == -1:
+                    break  # key still streaming (short — hold)
+                self._g4_key = buf[:colon].strip()
+                self._buffer = buf[colon + 1:]
+                self._g4_mode = "dispatch"
+                continue
+
+            if mode == "dispatch":
+                stripped = buf.lstrip()
+                if stripped != buf:
+                    self._buffer = stripped
+                    continue
+                lead = "{" if not self._args_started else ","
+                if buf.startswith(Q):
+                    self._args_started = True
+                    _emit(lead + json.dumps(self._g4_key, ensure_ascii=False) + ':"')
+                    self._buffer = buf[len(Q):]
+                    self._g4_mode = "pstr"
+                    continue
+                if self._ends_with_partial_token(buf, Q) == len(buf):
+                    break  # could still become the opening quote marker
+                self._args_started = True
+                self._g4_lead = lead
+                self._g4_scanned = 0
+                self._g4_depth = 0
+                self._g4_in_str = False
+                self._g4_mode = "vbuf"
+                continue
+
+            if mode == "pstr":
+                end = buf.find(Q)
+                if end == -1:
+                    hold = self._ends_with_partial_token(buf, Q)
+                    emit_now = buf[: len(buf) - hold] if hold else buf
+                    if emit_now:
+                        _emit(self._json_escape_chunk(emit_now))
+                        self._buffer = buf[len(emit_now):]
+                    break
+                _emit(self._json_escape_chunk(buf[:end]) + '"')
+                _update_prev()
+                self._buffer = buf[end + len(Q):]
+                self._g4_mode = "key_sep"
+                continue
+
+            if mode == "key_sep":
+                stripped = buf.lstrip()
+                if stripped != buf:
+                    self._buffer = stripped
+                    continue
+                if buf.startswith(","):
+                    self._buffer = buf[1:]
+                    self._g4_mode = "key"
+                    continue
+                if buf.startswith("}"):
+                    self._g4_mode = "key"  # key state handles the close
+                    continue
+                break  # separator still streaming
+
+            if mode == "vbuf":
+                # Scan for the top-level , or } terminator, quote/depth aware.
+                hold = self._ends_with_partial_token(buf, Q)
+                limit = len(buf) - hold
+                i = self._g4_scanned
+                term = -1
+                while i < limit:
+                    if buf.startswith(Q, i):
+                        self._g4_in_str = not self._g4_in_str
+                        i += len(Q)
+                        continue
+                    ch = buf[i]
+                    if not self._g4_in_str:
+                        if ch in "{[":
+                            self._g4_depth += 1
+                        elif ch in "]}" and self._g4_depth > 0:
+                            self._g4_depth -= 1
+                        elif self._g4_depth == 0 and ch in ",}":
+                            term = i
+                            break
+                    i += 1
+                if term == -1:
+                    self._g4_scanned = i
+                    break  # value still streaming — keep buffering
+                raw = buf[:term].strip()
+                converted = _parse_gemma_value(raw)
+                _emit(
+                    self._g4_lead
+                    + json.dumps(self._g4_key, ensure_ascii=False)
+                    + ":"
+                    + json.dumps(converted, ensure_ascii=False)
+                )
+                _update_prev()
+                self._g4_scanned = 0
+                if buf[term] == ",":
+                    self._buffer = buf[term + 1:]
+                    self._g4_mode = "key"
+                else:
+                    self._buffer = buf[term:]
+                    self._g4_mode = "key"  # key state emits the close on '}'
+                continue
+
+            if mode == "await_eot":
+                pos = buf.find(self.eot_token)
+                if pos == -1:
+                    hold = self._ends_with_partial_token(buf, self.eot_token)
+                    if len(buf) - hold > 0 and buf[: len(buf) - hold].strip() == "":
+                        self._buffer = buf[len(buf) - hold:]
+                        break
+                    if hold:
+                        break
+                    # No closing marker and non-whitespace content: treat as done.
+                    self._g4_mode = "idle"
+                    continue
+                self._buffer = buf[pos + len(self.eot_token):]
+                self._g4_mode = "idle"
+                continue
+
+            if mode == "swallow":
+                pos = buf.find(self.eot_token)
+                if pos == -1:
+                    hold = self._ends_with_partial_token(buf, self.eot_token)
+                    self._buffer = buf[len(buf) - hold:] if hold else ""
+                    break
+                self._buffer = buf[pos + len(self.eot_token):]
+                self._g4_mode = "idle"
+                continue
+
+        return StreamingParseResult(normal_text="".join(normal_parts), calls=calls)
+
+    def finish_streaming(self) -> str:
+        residual, self._buffer = self._buffer, ""
+        mode = getattr(self, "_g4_mode", "idle")
+        self._g4_reset()
+        if mode != "idle" or self.bot_token in residual:
+            return ""
+        if self.eot_token in residual:
+            residual = residual.replace(self.eot_token, "")
+        if self.prev_tool_call_arr and residual.strip() == "":
+            return ""
+        return residual
+
+
+class MiniMaxDetector(InvokeParamStreamMixin, BaseFormatDetector):
+    _ps_trim = "\n"
+    _ps_trim_single = False
+    _ps_missing_type = "loose"
+
+    """FreeToken serving adapter for MiniMax-M2 XML tool-call blocks.
+
+    LightLLM routes MiniMax mostly through reasoning parser/template handling; FreeToken's
+    OpenAI-compatible server consumes the final ``<minimax:tool_call>`` block here.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.bot_token = "<minimax:tool_call>"
+        self.eot_token = "</minimax:tool_call>"
+        self.invoke_regex = re.compile(r'<invoke\s+name="([^"]+)"\s*>(.*?)</invoke>', re.DOTALL)
+        self.param_regex = re.compile(r'<parameter\s+name="([^"]+)"\s*>(.*?)</parameter>', re.DOTALL)
+
+        # InvokeParamStreamMixin grammar
+        self._ps_outer_open = "<minimax:tool_call>"
+        self._ps_outer_close = "</minimax:tool_call>"
+        self._ps_invoke_open_prefix = "<invoke"
+        self._ps_invoke_open_re = re.compile(r'<invoke\s+name="([^"]+)"\s*>')
+        self._ps_invoke_close = "</invoke>"
+        self._ps_param_open_prefix = "<parameter"
+        self._ps_param_open_re = re.compile(r'<parameter\s+name="([^"]+)"\s*>')
+        self._ps_param_close = "</parameter>"
+        self._ps_reset()
+
+    def has_tool_call(self, text: str) -> bool:
+        return self.bot_token in text
+
+    def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
+        idx = text.find(self.bot_token)
+        normal_text = text[:idx].strip() if idx != -1 else text
+        if idx == -1:
+            return StreamingParseResult(normal_text=normal_text, calls=[])
+
+        tool_indices = self._get_tool_indices(tools)
+        calls: List[ToolCallItem] = []
+        for func_name, invoke_body in self.invoke_regex.findall(text):
+            if func_name not in tool_indices and not _should_forward_unknown_tool(func_name):
+                logger.warning(f"Model attempted to call undefined function: {func_name}")
+                continue
+            args = {}
+            config = self._get_param_config(func_name, tools)
+            for name, value in self.param_regex.findall(invoke_body):
+                key = name.strip()
+                raw = value.strip("\n")
+                if key in config:
+                    args[key] = self._convert_param_value(raw, key, config, func_name)
+                else:
+                    args[key] = _parse_loose_json_value(raw)
+            calls.append(
+                ToolCallItem(
+                    tool_index=len(calls),
+                    name=func_name,
+                    parameters=json.dumps(args, ensure_ascii=False),
+                )
+            )
+        return StreamingParseResult(normal_text=normal_text, calls=calls)
+
+
+
+class GptOssDetector(BaseFormatDetector):
+    """FreeToken serving adapter for Harmony ``to=functions.*`` tool calls.
+
+    LightLLM preserves these Harmony blocks in its reasoning parser. FreeToken's current
+    OpenAI-compatible path does not run a separate reasoning parser before tool parsing, so
+    this detector extracts the function call directly from the preserved Harmony text.
+
+    Streaming is a small channel state machine (vLLM's harmony rail is token-id
+    driven via StreamableParser; this is the text-marker translation since only
+    detokenized text is available here, with the same semantics): text outside
+    harmony blocks streams live; a ``commentary ... to=functions.NAME`` header
+    opens a call whose body bytes (``<|constrain|>json`` — the raw arguments
+    JSON) stream as prefix-stable fragments until a closing boundary; blocks of
+    other channels are swallowed (they only reach this detector when no reasoning
+    parser runs upstream, matching detect_and_parse which drops them too).
+    """
+
+    _BLOCK_OPENERS = ("<|start|>", "<|channel|>")
+    _CLOSING_TOKENS = ("<|end|>", "<|return|>", "<|call|>")
+    _name_regex = re.compile(r"to=functions\.([^\s<]+)")
+
+    def __init__(self):
+        super().__init__()
+        self.bot_token = "<|channel|>"
+        self.eot_token = "<|end|>"
+        self.call_regex = re.compile(
+            r"<\|channel\|>commentary\s+to=functions\.([^\s<]+)"
+            r".*?<\|message\|>(.*?)(?=<\|end\|>|<\|start\|>|$)",
+            re.DOTALL,
+        )
+        self._mode = "text"  # "text" | "tool_body" | "skip_body"
+        self._args_acc = ""
+
+    def has_tool_call(self, text: str) -> bool:
+        return "to=functions." in text and "<|message|>" in text
+
+    def block_close_tokens(self) -> tuple:
+        return self._CLOSING_TOKENS
+
+    @staticmethod
+    def _partial_suffix(text: str, tokens) -> int:
+        best = 0
+        for tok in tokens:
+            for k in range(min(len(tok) - 1, len(text)), best, -1):
+                if text.endswith(tok[:k]):
+                    best = k
+                    break
+        return best
+
+    @staticmethod
+    def _earliest(text: str, tokens):
+        best_pos, best_tok = -1, None
+        for tok in tokens:
+            pos = text.find(tok)
+            if pos != -1 and (best_pos == -1 or pos < best_pos):
+                best_pos, best_tok = pos, tok
+        return best_pos, best_tok
+
+    def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
+        idx = _first_existing_pos(text, ["<|start|>", "<|channel|>"])
+        normal_text = text[:idx].strip() if idx != -1 else text
+        if not self.has_tool_call(text):
+            return StreamingParseResult(normal_text=normal_text, calls=[])
+
+        tool_indices = self._get_tool_indices(tools)
+        calls: List[ToolCallItem] = []
+        for func_name, payload in self.call_regex.findall(text):
+            if func_name not in tool_indices and not _should_forward_unknown_tool(func_name):
+                logger.warning(f"Model attempted to call undefined function: {func_name}")
+                continue
+            args = _parse_first_json_value(payload)
+            if args is None:
+                continue
+            calls.append(
+                ToolCallItem(
+                    tool_index=len(calls),
+                    name=func_name,
+                    parameters=json.dumps(args, ensure_ascii=False),
+                )
+            )
+        return StreamingParseResult(normal_text=normal_text, calls=calls)
+
+    def parse_streaming_increment(self, new_text: str, tools: List[Tool]) -> StreamingParseResult:
+        self._buffer += new_text
+        if not hasattr(self, "_tool_indices"):
+            self._tool_indices = self._get_tool_indices(tools)
+        normal_parts: List[str] = []
+        calls: List[ToolCallItem] = []
+        while True:
+            buf = self._buffer
+            if not buf:
+                break
+            if self._mode == "text":
+                if calls:
+                    break  # text after a call defers to the next step (wire order)
+                pos, _tok = self._earliest(buf, self._BLOCK_OPENERS)
+                if pos == -1:
+                    hold = self._partial_suffix(buf, self._BLOCK_OPENERS)
+                    release = buf[: len(buf) - hold] if hold else buf
+                    if release:
+                        normal_parts.append(release)
+                        self._buffer = buf[len(release):]
+                    break
+                if pos > 0:
+                    normal_parts.append(buf[:pos])
+                    self._buffer = buf[pos:]
+                    continue
+                msg = buf.find("<|message|>")
+                if msg == -1:
+                    break  # header still streaming
+                header = buf[:msg]
+                self._buffer = buf[msg + len("<|message|>"):]
+                m = self._name_regex.search(header) if "commentary" in header else None
+                func_name = m.group(1) if m else None
+                if func_name and (
+                    func_name in self._tool_indices or _should_forward_unknown_tool(func_name)
+                ):
+                    if self.current_tool_id == -1:
+                        self.current_tool_id = 0
+                    while len(self.prev_tool_call_arr) <= self.current_tool_id:
+                        self.prev_tool_call_arr.append({})
+                    while len(self.streamed_args_for_tool) <= self.current_tool_id:
+                        self.streamed_args_for_tool.append("")
+                    calls.append(
+                        ToolCallItem(
+                            tool_index=self.current_tool_id, name=func_name, parameters=""
+                        )
+                    )
+                    self.prev_tool_call_arr[self.current_tool_id] = {
+                        "name": func_name,
+                        "arguments": {},
+                    }
+                    self._args_acc = ""
+                    self._mode = "tool_body"
+                else:
+                    self._mode = "skip_body"
+                continue
+            # Body modes: stream (tool) or swallow (other channels) until a boundary.
+            boundaries = self._CLOSING_TOKENS + self._BLOCK_OPENERS
+            pos, tok = self._earliest(buf, boundaries)
+            if pos == -1:
+                hold = self._partial_suffix(buf, boundaries)
+                emit_len = len(buf) - hold
+                if emit_len > 0:
+                    piece = buf[:emit_len]
+                    self._buffer = buf[emit_len:]
+                    if self._mode == "tool_body":
+                        self._args_acc += piece
+                        self.streamed_args_for_tool[self.current_tool_id] += piece
+                        calls.append(
+                            ToolCallItem(
+                                tool_index=self.current_tool_id, name=None, parameters=piece
+                            )
+                        )
+                break
+            piece = buf[:pos]
+            if tok in self._CLOSING_TOKENS:
+                self._buffer = buf[pos + len(tok):]
+            else:
+                self._buffer = buf[pos:]  # an opener belongs to the NEXT block
+            if self._mode == "tool_body":
+                if piece:
+                    self._args_acc += piece
+                    self.streamed_args_for_tool[self.current_tool_id] += piece
+                    calls.append(
+                        ToolCallItem(
+                            tool_index=self.current_tool_id, name=None, parameters=piece
+                        )
+                    )
+                parsed_args = _parse_first_json_value(self._args_acc)
+                self.prev_tool_call_arr[self.current_tool_id]["arguments"] = (
+                    parsed_args if isinstance(parsed_args, dict) else {}
+                )
+                self.streamed_args_for_tool[self.current_tool_id] = ""
+                self.current_tool_id += 1
+                self._args_acc = ""
+            self._mode = "text"
+        return StreamingParseResult(normal_text="".join(normal_parts), calls=calls)
+
+    def finish_streaming(self) -> str:
+        residual, self._buffer = self._buffer, ""
+        mode, self._mode = self._mode, "text"
+        if mode != "text" or any(op in residual for op in self._BLOCK_OPENERS):
+            return ""
+        return residual
+
+
+
+class FunctionCallParser:
+    """
+    Parser for function/tool calls in model outputs.
+
+    This class handles both streaming and non-streaming parsing of function calls using a detector.
+    In streaming scenarios, each time new_text is received, it calls detector.parse_streaming_increment
+    and returns the resulting normal_text and calls to the upper layer (or SSE).
+    """
+
+    ToolCallParserEnum: Dict[str, Type[BaseFormatDetector]] = {
+        "deepseekv32": DeepSeekV32Detector,
+        "gemma4": Gemma4Detector,
+        "gpt-oss": GptOssDetector,
+        "gpt_oss": GptOssDetector,
+        "glm47": Glm47Detector,
+        "llama3": Llama32Detector,
+        "minimax": MiniMaxDetector,
+        "mistral": MistralDetector,
+        "qwen": Qwen25Detector,
+        "qwen25": Qwen25Detector,
+        "qwen3_coder": Qwen3CoderDetector,
+    }
+
+    def __init__(self, tools: List[Tool], tool_call_parser: str):
+        detector: Type[BaseFormatDetector] = None
+        detector_class = self.ToolCallParserEnum.get(tool_call_parser)
+        if detector_class:
+            detector = detector_class()
+        else:
+            raise ValueError(f"Unsupported tool_call_parser: {tool_call_parser}")
+
+        self.detector = detector
+        self.tools = _coerce_tools(tools)
+
+    def has_tool_call(self, text: str) -> bool:
+        """
+        Check if the given text contains a tool call in the format supported by this parser.
+        This delegates to the detector's implementation.
+
+        Args:
+            text: The text to check for tool calls
+
+        Returns:
+            True if the text contains a tool call, False otherwise
+        """
+        if not self.tools:
+            return False
+        return self.detector.has_tool_call(text)
+
+    def parse_non_stream(self, full_text: str) -> StreamingParseResult:
+        """
+        One-time parsing of the full text to extract tool calls.
+
+        Args:
+            full_text: The complete text to parse
+
+        Returns:
+            StreamingParseResult with normal_text and parsed calls.
+        """
+        if not self.tools:
+            return StreamingParseResult(normal_text=full_text, calls=[])
+        parsed_result = self.detector.detect_and_parse(full_text, self.tools)
+        tool_call_list = parsed_result.calls
+        if tool_call_list:
+            # Keep text after the LAST tool block: the streaming path emits it, so
+            # one-shot parsing must agree instead of silently dropping it.
+            tail_start = -1
+            for tok in self.detector.block_close_tokens():
+                pos = full_text.rfind(tok)
+                if pos != -1:
+                    tail_start = max(tail_start, pos + len(tok))
+            if tail_start != -1:
+                tail = full_text[tail_start:]
+                normal = parsed_result.normal_text or ""
+                # Only plain text: an unterminated final block would make the
+                # "last closer" precede it and leak markup into content.
+                if tail.strip() and tail.strip() not in normal and not self.detector.has_tool_call(tail):
+                    parsed_result.normal_text = normal + tail
+            return parsed_result
+        else:
+            return StreamingParseResult(normal_text=full_text, calls=[])
+
+    def parse_stream_chunk(self, chunk_text: str) -> Tuple[str, list[ToolCallItem]]:
+        """
+        Streaming incremental parsing of chunks of text as they arrive.
+
+        Args:
+            chunk_text: The new chunk of text to parse
+
+        Returns:
+            A tuple containing:
+            - The normal text that should be displayed to the user
+            - A list of tool calls parsed from the chunk
+        """
+        normal_parts: list[str] = []
+        final_calls: list[ToolCallItem] = []
+        for kind, payload in self.parse_stream_events(chunk_text):
+            if kind == "text":
+                normal_parts.append(payload)
+            else:
+                final_calls.extend(payload)
+        return "".join(normal_parts), final_calls
+
+    def parse_stream_events(self, chunk_text: str) -> list[tuple[str, Any]]:
+        """Ordered streaming parse: ``[("text", str) | ("calls", [ToolCallItem]), ...]``
+        segments in generation order. Detectors return text-before-calls within one
+        increment; segments across drain iterations keep the true interleaving
+        (pre-text, call, trailing text) that a flat (text, calls) pair loses."""
+        if not self.tools:
+            return [("text", chunk_text)] if chunk_text else []
+        segments: list[tuple[str, Any]] = []
+
+        # Drain loop: an increment may return after consuming only part of its buffer
+        # (e.g. one complete invoke of several, leaving the rest and the closing tag
+        # behind). Re-feed "" until the detector stops making progress.
+        text = chunk_text
+        for _ in range(16):
+            sp_result = self.detector.parse_streaming_increment(text, self.tools)
+            if sp_result.normal_text:
+                segments.append(("text", sp_result.normal_text))
+            if sp_result.calls:
+                segments.append(("calls", sp_result.calls))
+            if text == "" and not sp_result.calls and not sp_result.normal_text:
+                break
+            text = ""
+        return segments
+
+    def recover_truncated_call(self) -> List[ToolCallItem]:
+        """Best-effort parse of a tool call cut off by end-of-generation while its
+        tag block was still open: append the closing tag and re-parse. Consumes the
+        detector buffer on success; returns [] when nothing recoverable."""
+        det = self.detector
+        buf = det._buffer
+        if not buf or not det.eot_token or not det.has_tool_call(buf):
+            return []
+        try:
+            parsed = det.detect_and_parse(buf + det.eot_token, self.tools)
+        except Exception:  # noqa: BLE001 — recovery is best-effort by definition
+            return []
+        if parsed.calls:
+            det._buffer = ""
+        return parsed.calls
+
+    def parse_streaming_increment(self, new_text: str) -> StreamingParseResult:
+        normal_text, calls = self.parse_stream_chunk(new_text)
+        return StreamingParseResult(normal_text=normal_text, calls=calls)
+
+    def supports_streaming(self) -> bool:
+        """Whether the underlying detector can parse incrementally; when False the
+        serving layer must buffer the full generation and use parse_non_stream."""
+        return bool(self.detector.supports_streaming)
+
+    def args_fragments_prefix_stable(self) -> bool:
+        """Whether streamed argument fragments always concatenate to a prefix of the
+        final arguments JSON (safe for clients that concatenate fragments)."""
+        return bool(self.detector.args_fragments_prefix_stable)
+
+    def finish_stream(self) -> str:
+        """End-of-stream drain: residual buffered text that is plain content (empty
+        when the buffer holds unfinished tool-call markup)."""
+        return self.detector.finish_streaming()
+
+    def unstreamed_arguments(self, tool_ordinal: int) -> str | None:
+        """Best-effort complete arguments JSON for a call whose argument stream was cut
+        short (generation truncated mid-call), from the detector's partial-parse state."""
+        arr = self.detector.prev_tool_call_arr
+        if 0 <= tool_ordinal < len(arr):
+            args = arr[tool_ordinal].get("arguments")
+            if args:
+                return json.dumps(args, ensure_ascii=False)
+        return None
+
+
+SUPPORTED_TOOL_CALL_PARSERS = list(FunctionCallParser.ToolCallParserEnum.keys())
+
+
+def _coerce_tools(tools: List[Any] | None) -> List[Tool]:
+    return [_coerce_tool(tool) for tool in tools or []]
+
+
+def _coerce_tool(tool: Any) -> Tool:
+    if isinstance(tool, Tool):
+        return tool
+    if isinstance(tool, dict):
+        return Tool.model_validate(tool)
+    function = getattr(tool, "function", None)
+    if function is None:
+        raise TypeError(f"Unsupported tool schema: {tool!r}")
+    return Tool(
+        type=getattr(tool, "type", "function"),
+        function=Function(
+            name=getattr(function, "name", None),
+            description=getattr(function, "description", None),
+            parameters=getattr(function, "parameters", None),
+        ),
+    )

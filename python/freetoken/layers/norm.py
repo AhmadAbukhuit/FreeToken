@@ -1,0 +1,98 @@
+from typing import Tuple
+
+import torch
+
+from .base import BaseOP
+
+
+class RMSNorm(BaseOP):
+    def __init__(self, size: int, eps: float) -> None:
+        from freetoken.kernel.backend import is_flashinfer_installed
+
+        if is_flashinfer_installed():
+            from flashinfer import rmsnorm
+        else:
+            from freetoken.kernel.triton.norm import rmsnorm
+
+        self.eps = eps
+        self.weight = torch.empty(size)
+        self.rmsnorm = rmsnorm
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.rmsnorm(x, self.weight, self.eps)
+
+    def forward_inplace(self, x: torch.Tensor) -> None:
+        self.rmsnorm(x, self.weight, self.eps, out=x)
+
+
+class GemmaRMSNorm(BaseOP):
+    """Gemma4-style RMSNorm backed directly by sgl_kernel.
+
+    Gemma4 scales by the raw checkpoint weight. ``with_scale=False`` uses a
+    runtime ones vector that is intentionally not part of ``state_dict``.
+    """
+
+    def __init__(self, size: int, eps: float, with_scale: bool = True) -> None:
+        from freetoken.kernel.backend import is_sgl_kernel_installed
+
+        if is_sgl_kernel_installed():
+            from sgl_kernel import fused_add_rmsnorm, rmsnorm
+        else:
+            from freetoken.kernel.triton.norm import fused_add_rmsnorm, rmsnorm
+
+        self.eps = eps
+        self.size = size
+        self.with_scale = with_scale
+        self.rmsnorm = rmsnorm
+        self.fused_add_rmsnorm = fused_add_rmsnorm
+        if with_scale:
+            self.weight = torch.empty(size)
+        else:
+            self._ones_weight: torch.Tensor | None = None
+
+    def _kernel_weight(self, x: torch.Tensor) -> torch.Tensor:
+        if self.with_scale:
+            return self.weight
+        if self._ones_weight is None:
+            self._ones_weight = torch.ones(self.size, device=x.device, dtype=x.dtype)
+        return self._ones_weight
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.dim() == 2:
+            return self.rmsnorm(x, self._kernel_weight(x), self.eps)
+        original_shape = x.shape
+        out = self.rmsnorm(
+            x.contiguous().reshape(-1, original_shape[-1]),
+            self._kernel_weight(x),
+            self.eps,
+        )
+        return out.reshape(original_shape)
+
+    def forward_add_residual(
+        self, x: torch.Tensor, residual: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        self.fused_add_rmsnorm(x, residual, self._kernel_weight(x), self.eps)
+        return x, residual
+
+
+class RMSNormFused(BaseOP):
+    def __init__(self, size: int, eps: float) -> None:
+        from freetoken.kernel.backend import is_flashinfer_installed
+
+        if is_flashinfer_installed():
+            from flashinfer import fused_add_rmsnorm, rmsnorm
+        else:
+            from freetoken.kernel.triton.norm import fused_add_rmsnorm, rmsnorm
+
+        self.eps = eps
+        self.weight = torch.empty(size)
+        self.rmsnorm = rmsnorm
+        self.fused_add_rmsnorm = fused_add_rmsnorm
+
+    def forward(
+        self, x: torch.Tensor, residual: torch.Tensor | None = None
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if residual is None:
+            return self.rmsnorm(x, self.weight, self.eps), x
+        self.fused_add_rmsnorm(x, residual, self.weight, self.eps)
+        return x, residual
