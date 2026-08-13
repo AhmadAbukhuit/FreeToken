@@ -381,7 +381,10 @@ def _swa_per_req_swa_floor(config) -> int:
     window = next(g.sliding_window for g in config.model_config.kv_cache_group_specs() if g.is_swa)
     ps = config.page_size
     locked = ((window + _SWA_RETAIN_GAP + ps - 1) // ps) * ps
-    return locked + window + _SWA_EVICTION_INTERVAL + 2 * ps
+    floor = locked + window + _SWA_EVICTION_INTERVAL + 2 * ps
+    if getattr(config, "special_token_ckpt", False):
+        floor += window + _SWA_RETAIN_GAP + _SWA_EVICTION_INTERVAL
+    return floor
 
 
 def _swa_pool_floor(config) -> int:

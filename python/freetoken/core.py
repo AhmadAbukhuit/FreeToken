@@ -53,6 +53,13 @@ class Req:
     mamba_restore_src: int | None = None            # on a prefix hit: tree snapshot slot to COW into the live slot (first chunk only)
     swa_evicted_seqlen: int = 0                      # SWA radix: positions < this had their swa KV freed (slid out of window) during decode
     decode_batch_idx: int = 0                        # SWA radix: # of decode forwards done; the proactive free_swa skips the first (overlap guard)
+    # Set once, at the first sampled tool-call opener token (scheduler detection): the state
+    # length just after that token (its index + 1). A client-side rewrite of the echoed tool
+    # call diverges strictly after this point, so it is the deepest reuse boundary that
+    # survives such a rewrite. GDN: the state is frozen into a ping-pong slot when cached_len
+    # reaches it (snapshot_toolcall_anchor) and donated at finish. SWA: caps the proactive
+    # out-of-window eviction so the window ending here stays resumable.
+    toolcall_anchor_len: int | None = None
     # Abort arrived while this request's forward was in flight (overlap scheduling). The abort
     # handler must not free resources under an in-flight forward; it sets this flag and
     # _process_last_data frees the request when the batch drains (after copy_done.synchronize).

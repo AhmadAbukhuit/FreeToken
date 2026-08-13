@@ -18,7 +18,12 @@ from freetoken.message import (
     PromptAdmittedMsg,
     UserMsg,
 )
-from freetoken.utils import init_logger, load_eos_token_ids, load_tokenizer
+from freetoken.utils import (
+    init_logger,
+    load_eos_token_ids,
+    load_tokenizer,
+    load_toolcall_anchor_id,
+)
 
 from .cache import CacheManager
 from .config import SchedulerConfig
@@ -106,6 +111,16 @@ class Scheduler(SchedulerIOMixin):
         self._pending_rebuild: CacheRebuildBackendMsg | None = None
         self.tokenizer = load_tokenizer(config.model_path)
         self.eos_token_ids = load_eos_token_ids(config.model_path, self.tokenizer)
+        self.toolcall_anchor_id = None
+        if config.special_token_ckpt and (
+            self.cache_manager.is_hybrid or self.cache_manager.is_swa
+        ):
+            from freetoken.server.function_call_parser import toolcall_opener_for
+
+            self.toolcall_anchor_id = load_toolcall_anchor_id(
+                self.tokenizer,
+                toolcall_opener_for(getattr(config, "tool_call_parser", "")),
+            )
         self.token_pool = self.table_manager.token_pool
         # Floor the prefill chunk by the cache manager's cap (DSV4: ~half the window pool) so a
         # sliding-window cache chunks long prompts and frees out-of-window pages between chunks
@@ -336,6 +351,12 @@ class Scheduler(SchedulerIOMixin):
                     if finished
                     else None
                 )
+                if (
+                    next_token == self.toolcall_anchor_id
+                    and req.toolcall_anchor_len is None
+                    and not finished
+                ):
+                    req.toolcall_anchor_len = req.input_ids.numel()
                 reply.append(
                     DetokenizeMsg(
                         uid=req.uid,
@@ -842,6 +863,8 @@ class Scheduler(SchedulerIOMixin):
     def _forward(self, forward_input: ForwardInput) -> ForwardOutput:
         batch, sample_args, input_mapping, output_mapping = forward_input
         batch.input_ids = self.token_pool[input_mapping]
+        if self.toolcall_anchor_id is not None and not batch.is_prefill:
+            self.cache_manager.snapshot_toolcall_anchor(batch.reqs)
         forward_output = self.engine.forward_batch(batch, sample_args)
         self.token_pool[output_mapping] = forward_output.next_tokens_gpu
         self.decode_manager.filter_reqs(forward_input.batch.reqs)

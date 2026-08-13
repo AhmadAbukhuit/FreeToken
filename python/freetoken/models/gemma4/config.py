@@ -80,14 +80,31 @@ def _parse_vision_config(top_cfg: Any, text_hidden_size: int) -> VisionConfig | 
     )
 
 
+def _attn_geometry(cfg: Any, layer_type: str, *, is_full: bool) -> tuple[int, int]:
+    """``(head_dim, num_kv_heads)`` of one gemma-4 attention type.
+
+    transformers >= 5.15 keeps both in ``per_layer_config`` and raises on a top-level read;
+    older releases flattened them, the full layers' values under a ``global_*`` twin.
+    """
+    if getattr(cfg, "is_heterogeneous", False):
+        layer_cfg = cfg.per_layer_config[layer_type]
+        return layer_cfg.head_dim, layer_cfg.num_key_value_heads
+    if not is_full:
+        return cfg.head_dim, cfg.num_key_value_heads
+    return (
+        getattr(cfg, "global_head_dim", None) or cfg.head_dim,
+        getattr(cfg, "num_global_key_value_heads", cfg.num_key_value_heads),
+    )
+
+
 def parse_config(hf_config: Any) -> ModelConfig:
     cfg, top_architectures, top_cfg = _text_config(hf_config)
     rope_params = cfg.rope_parameters
     swa_type, full_type = "sliding_attention", "full_attention"
     sliding_rope = rope_params[swa_type]
     full_rope = rope_params[full_type]
-    sliding_head_dim = cfg.head_dim
-    full_head_dim = getattr(cfg, "global_head_dim", None) or sliding_head_dim
+    sliding_head_dim, sliding_kv_heads = _attn_geometry(cfg, swa_type, is_full=False)
+    full_head_dim, full_kv_heads = _attn_geometry(cfg, full_type, is_full=True)
     full_partial_rotary_factor = float(full_rope.get("partial_rotary_factor", 1.0))
     sliding_layer_ids = tuple(
         i for i, layer_type in enumerate(cfg.layer_types) if layer_type != full_type
@@ -139,9 +156,7 @@ def parse_config(hf_config: Any) -> ModelConfig:
     return ModelConfig(
         num_layers=cfg.num_hidden_layers,
         num_qo_heads=cfg.num_attention_heads,
-        num_kv_heads=getattr(
-            cfg, "num_global_key_value_heads", cfg.num_key_value_heads
-        ),
+        num_kv_heads=full_kv_heads,
         head_dim=full_head_dim,
         hidden_size=cfg.hidden_size,
         vocab_size=cfg.vocab_size,
@@ -169,11 +184,7 @@ def parse_config(hf_config: Any) -> ModelConfig:
             FullAttentionGroupConfig(
                 name="full",
                 layer_ids=full_layer_ids,
-                num_kv_heads=getattr(
-                    cfg,
-                    "num_global_key_value_heads",
-                    cfg.num_key_value_heads,
-                ),
+                num_kv_heads=full_kv_heads,
                 head_dim=full_head_dim,
                 rotary_config=full_rotary_config,
                 k_eq_v=bool(getattr(cfg, "attention_k_eq_v", False)),
@@ -181,7 +192,7 @@ def parse_config(hf_config: Any) -> ModelConfig:
             SWAAttentionGroupConfig(
                 name="swa",
                 layer_ids=sliding_layer_ids,
-                num_kv_heads=cfg.num_key_value_heads,
+                num_kv_heads=sliding_kv_heads,
                 head_dim=sliding_head_dim,
                 rotary_config=swa_rotary_config,
                 sliding_window=cfg.sliding_window,

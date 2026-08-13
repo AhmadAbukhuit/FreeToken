@@ -72,6 +72,23 @@ def load_eos_token_ids(
     return frozenset(ids)
 
 
+def load_toolcall_anchor_id(
+    tokenizer: PreTrainedTokenizerBase, opener: str | None
+) -> int | None:
+    """The single token id of ``opener`` -- the wire format's unique tool-call opening
+    marker, declared by the model's detector (``BaseFormatDetector.toolcall_opener``).
+    None when there is no opener or the tokenizer spells it with more than one token:
+    the scheduler's special-token checkpoint matches sampled ids one at a time, so only
+    a one-token opener can anchor."""
+    if not opener:
+        return None
+    try:
+        ids = tokenizer.encode(opener, add_special_tokens=False)
+    except Exception:
+        return None
+    return int(ids[0]) if len(ids) == 1 else None
+
+
 def load_generation_sampling(model_path: str) -> dict[str, Any]:
     """Recommended sampling defaults from ``generation_config.json`` (sglang's
     ``sampling_defaults='model'``). Returns ``{temperature, top_k, top_p}`` for the keys

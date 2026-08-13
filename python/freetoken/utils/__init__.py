@@ -11,6 +11,7 @@ from .hf import (
     load_eos_token_ids,
     load_generation_sampling,
     load_tokenizer,
+    load_toolcall_anchor_id,
 )
 from .logger import init_logger
 from .misc import UNSET, Unset, align_ceil, align_down, call_if_main, div_ceil, div_even, mem_GB
@@ -31,6 +32,7 @@ __all__ = [
     "load_eos_token_ids",
     "load_generation_sampling",
     "load_tokenizer",
+    "load_toolcall_anchor_id",
     "init_logger",
     "is_arch_supported",
     "is_sm90_family",
