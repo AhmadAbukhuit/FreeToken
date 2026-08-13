@@ -76,7 +76,7 @@ uv venv --quiet --python "$PYBIN" "$VENV"
 uv pip install --quiet --python "$VENV/bin/python" \
   --index-url https://download.pytorch.org/whl/cu130 "torch>=2.11,<2.12"
 uv pip install --quiet --python "$VENV/bin/python" \
-  "setuptools>=77" wheel ninja "apache-tvm-ffi>=0.1.4,<0.2"
+  "setuptools>=77" wheel ninja "apache-tvm-ffi==0.1.13.post3"
 
 export FREETOKEN_BUILD_PYTHON="$VENV/bin/python"
 export FREETOKEN_BUILD_OUT_DIR=/ci-out

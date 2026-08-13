@@ -19,11 +19,11 @@ license-files = ["LICENSE"]
 # resolve, tight enough to bar a silent breaking bump). These ranges are the contract;
 # there is no lockfile.
 dependencies = [
-    "apache-tvm-ffi>=0.1.4,<0.2",
+    "apache-tvm-ffi==0.1.13.post3", # pin it
     "einops>=0.8,<1",
     "fastapi>=0.115,<1",
     # slot_cache: the device-side LRU admission kernel behind the MoE expert cache.
-    "flashlib>=0.3,<1",
+    "flashlib==0.3.0", # pin it
     "gguf>=0.19,<1",
     "huggingface_hub>=1.5,<2",
     "msgpack>=1.1,<2",
@@ -42,7 +42,7 @@ dependencies = [
     "torch>=2.11,<2.12",
     "tqdm>=4.66,<5",
     "transformers>=5.5,<6",
-    "triton>=3.6,<4",  # e4m3_compat needs tl.target_info + constexpr_function (3.5+); tested on 3.6
+    "triton==3.6.0",
     "uvicorn>=0.30,<1",
 ]
 
