@@ -544,6 +544,21 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--enable-special-token-ckpt",
+        action="store_true",
+        dest="special_token_ckpt",
+        default=ServerArgs.special_token_ckpt,
+        help=(
+            "Checkpoint decode state at special tokens (currently the tool-call opener). "
+            "When a GDN-hybrid or SWA model samples its tool-call opener token, the "
+            "scheduler preserves a reuse point just after it (GDN: a state snapshot "
+            "donated to the prefix cache; SWA: the trailing window is kept resumable), so "
+            "a client that rewrites the echoed tool call only invalidates the call body, "
+            "not the turn."
+        ),
+    )
+
+    parser.add_argument(
         "--moe-prefill-hit-d2d",
         action="store_true",
         dest="moe_prefill_hit_d2d",

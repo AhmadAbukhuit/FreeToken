@@ -239,6 +239,14 @@ class BaseFormatDetector(ABC):
     # when this holds; otherwise they send the full arguments once at close.
     args_fragments_prefix_stable = True
 
+    # The marker that UNIQUELY opens a tool-call block in this wire format, or None when
+    # no such marker exists (gpt-oss: <|channel|> opens every channel header, tool call or
+    # not; DSV32/DSV4: the DSML opener is a multi-piece composite). Consumed by the
+    # scheduler's special-token checkpoint, which only uses it when the tokenizer encodes
+    # it as a single token. Often equals bot_token, but declared separately because
+    # bot_token is a parse trigger, not a uniqueness claim.
+    toolcall_opener: str | None = None
+
     def __init__(self):
         # Streaming state management
         # Buffer for accumulating incomplete patterns that arrive across multiple streaming chunks
@@ -899,7 +907,7 @@ class Qwen25Detector(BaseFormatDetector):
 
     Reference: https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct?chat_template=default
     """
-
+    toolcall_opener = "<tool_call>"
     def __init__(self):
         """
         Initializes the detector with necessary state variables.
@@ -1091,7 +1099,7 @@ class Llama32Detector(BaseFormatDetector):
     <python_tag>{"name":"xxx", "arguments":{...}}
     ```
     """
-
+    toolcall_opener = "<|python_tag|>"
     def __init__(self):
         super().__init__()
         self.bot_token = "<|python_tag|>"
@@ -1181,7 +1189,7 @@ class Glm47Detector(BaseFormatDetector):
 
     Reference: https://github.com/vllm-project/vllm/blob/main/vllm/tool_parsers/glm4_moe_tool_parser.py
     """
-
+    toolcall_opener = "<tool_call>"
     def __init__(self):
         super().__init__()
         self.bot_token = "<tool_call>"
@@ -1859,6 +1867,7 @@ class DeepSeekV32Detector(BaseFormatDetector):
 
 
 class Qwen3CoderDetector(InvokeParamStreamMixin, BaseFormatDetector):
+    toolcall_opener = "<tool_call>"
     _ps_trim = "\n"
     _ps_trim_single = True
     _ps_missing_type = "string"
@@ -2024,7 +2033,7 @@ class Qwen3CoderDetector(InvokeParamStreamMixin, BaseFormatDetector):
 
 class Gemma4Detector(BaseFormatDetector):
     """FreeToken serving adapter for Gemma4's compact tool-call format."""
-
+    toolcall_opener = "<|tool_call>"
     def __init__(self):
         super().__init__()
         self.bot_token = "<|tool_call>"
@@ -2313,6 +2322,7 @@ class Gemma4Detector(BaseFormatDetector):
 
 
 class MiniMaxDetector(InvokeParamStreamMixin, BaseFormatDetector):
+    toolcall_opener = "<minimax:tool_call>"
     _ps_trim = "\n"
     _ps_trim_single = False
     _ps_missing_type = "loose"
@@ -2738,6 +2748,13 @@ class FunctionCallParser:
 
 
 SUPPORTED_TOOL_CALL_PARSERS = list(FunctionCallParser.ToolCallParserEnum.keys())
+
+
+def toolcall_opener_for(tool_call_parser: str) -> str | None:
+    """The configured parser's unique tool-call opening marker, or None when the format has
+    no single unique opener (see ``BaseFormatDetector.toolcall_opener``)."""
+    detector = FunctionCallParser.ToolCallParserEnum.get(tool_call_parser)
+    return detector.toolcall_opener if detector is not None else None
 
 
 def _coerce_tools(tools: List[Any] | None) -> List[Tool]:

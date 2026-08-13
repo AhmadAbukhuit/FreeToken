@@ -59,6 +59,7 @@ def _setup():
         prefill_manager=pm,
         finished_reqs=set(),
         eos_token_ids=set(),
+        toolcall_anchor_id=None,
         config=SimpleNamespace(page_size=1),
         status_reporter=SimpleNamespace(report_batch=lambda *_, **__: None),
         send_result=sent.extend,

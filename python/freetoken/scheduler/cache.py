@@ -141,6 +141,33 @@ class CacheManager:
             self.linear_state_pool.free(er.mamba_slots)
             self._free(er.kv_indices)
 
+    def snapshot_toolcall_anchor(self, reqs: List[Req]) -> None:
+        """Freeze each decoding request's GDN state at its tool-call anchor, into the ping-pong
+        slot that is idle during decode (the kernel-side ×CHUNK track only runs on prefill
+        extends). Must run on the engine stream before the current step's kernels: cached_len
+        equals the anchor exactly when every enqueued step up to the anchor-consuming one has
+        been issued and the next (current) one has not, so the copy lands between them in
+        stream order. Reuses ``mamba_last_track_seqlen`` as the pending-donate mark -- the
+        prefill track's own pending freeze was consumed by the prefill-commit ``cache_req``
+        before any decode drain could set an anchor."""
+        if not self.is_hybrid:
+            return
+        pool = self.linear_state_pool
+        for r in reqs:
+            a = r.toolcall_anchor_len
+            if (
+                a is None
+                or r.mamba_ping_pong is None
+                or r.mamba_last_track_seqlen is not None
+                or r.cached_len != a
+                or align_down(a, self.page_size) != a
+            ):
+                continue
+            dst = r.mamba_ping_pong[r.mamba_next_track_idx]
+            pool.copy_from(r.linear_slot_idx, dst)
+            r.mamba_last_track_seqlen = a
+            r.mamba_next_track_idx = 1 - r.mamba_next_track_idx
+
     def maybe_free_swa_out_of_window(self, reqs: List[Req], *, forward_iter: int) -> None:
         """Proactively free each decoding request's now-out-of-window SWA slots, bounding its swa
         footprint to ~one window so a smaller-than-full swa pool (swa_full_tokens_ratio<1) stays
@@ -158,6 +185,22 @@ class CacheManager:
                 continue                       # overlap guard: extend forward may still be running
             floor = req.cache_handle.cached_len   # reused prefix -> its swa is tree-owned, not ours
             threshold = (req.device_len - 1) - window - self.page_size
+            if req.toolcall_anchor_len is not None:
+                # Keep the window ending at the anchor resumable: a client-side rewrite of the
+                # echoed tool call forks after the anchor, and a resume there needs
+                # [anchor - window, anchor) live. The finish-insert then adopts (rather than
+                # tombstones) these never-evicted slots; they stay unlocked, so real pool
+                # pressure can still reclaim them (same soft retention as the prompt-end pin).
+                cap = req.toolcall_anchor_len - window - _SWA_RETAIN_GAP
+                if threshold - cap > window + _SWA_RETAIN_GAP:
+                    # The decode ran on far past the anchor (a tool call is normally within
+                    # tens of tokens of the end). Holding the cap would grow this request's
+                    # live swa without bound ("SWA pool exhausted" is unhandled) -- drop the
+                    # anchor and let normal eviction resume. This bound is what the
+                    # anchor-retention term in _swa_per_req_swa_floor sizes the pool for.
+                    req.toolcall_anchor_len = None
+                else:
+                    threshold = min(threshold, cap)
             new_evicted = align_down(threshold, self.page_size)
             start = max(req.swa_evicted_seqlen, floor)
             if new_evicted > start:
@@ -308,6 +351,29 @@ class CacheManager:
             return
 
         if finished:
+            # A pending freeze (the tool-call anchor, or a prefill ×64 track the request
+            # finished too early to chunk-commit) is a strictly shorter prefix than the live
+            # donate below: insert it first and advance the dedup-free floor to its boundary
+            # -- [prefix_len, L) is now tree-owned by the donated node, so only [old, prefix_len)
+            # is this request's dup to free. The frozen slot is consumed either way (taken by
+            # the tree or freed here) and both ping-pong refs are dropped before
+            # _free_req_slots so nothing double-frees.
+            free_upto = old_handle.cached_len
+            L = req.mamba_last_track_seqlen
+            if (
+                L is not None
+                and 0 < L <= req.cached_len
+                and align_down(L, self.page_size) == L
+                and req.mamba_ping_pong is not None
+            ):
+                frozen_idx = 1 - req.mamba_next_track_idx
+                frozen = req.mamba_ping_pong[frozen_idx]
+                prefix_len, mamba_exist = self.prefix_cache.insert(
+                    req.input_ids[:L], page_indices[:L], frozen)
+                pool.free([s for s in req.mamba_ping_pong if mamba_exist or s != frozen])
+                req.mamba_ping_pong = None
+                self._free(page_indices[free_upto : max(free_upto, prefix_len)])
+                free_upto = max(free_upto, L)
             # Donate the live slot (final full-sequence state). The live state is at cached_len;
             # only attach it when cached_len is itself the page-aligned node boundary (always for
             # page_size==1). For page_size>1 a non-aligned cached_len would attach an over-advanced
@@ -319,11 +385,11 @@ class CacheManager:
                 prefix_len, mamba_exist = self.prefix_cache.insert(
                     req.input_ids[:insert_len], page_indices[:insert_len], req.linear_slot_idx)
                 self.unlock(old_handle)
-                self._free(page_indices[old_handle.cached_len : prefix_len])
+                self._free(page_indices[free_upto : max(free_upto, prefix_len)])
                 keep_live = not mamba_exist           # tree now owns linear_slot_idx
             else:
                 self.unlock(old_handle)
-                self._free(page_indices[old_handle.cached_len :])
+                self._free(page_indices[free_upto :])
             self._free_req_slots(req, keep_live=keep_live)
             return
 
