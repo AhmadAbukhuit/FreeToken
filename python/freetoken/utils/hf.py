@@ -200,8 +200,13 @@ def cached_load_hf_config(model_path: str) -> PretrainedConfig:
         return build_gguf_shim(gguf_src)
     config = _load_hf_config(model_path)
     if isinstance(config, RawConfigShim):
-        return RawConfigShim(config.to_dict())
-    return type(config)(**config.to_dict())
+        shim = RawConfigShim(config.to_dict())
+        shim._name_or_path = model_path
+        return shim
+    
+    new_config = type(config)(**config.to_dict())
+    new_config._name_or_path = model_path
+    return new_config
 
 
 def download_hf_weight(model_path: str) -> str:

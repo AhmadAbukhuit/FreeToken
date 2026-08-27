@@ -1,0 +1,81 @@
+# Docker Build & Lint Check: Validate Dockerfile best practices and ensure
+# the container builds successfully on the default branch.
+#
+# This workflow is designed to prevent bad Dockerfiles (e.g., those with missing
+# apt cleanups, invalid base images, or broken build steps) from being merged
+# into the codebase.
+#
+# Trigger policy -- runs on both push and pull_request to the main branch, but
+# only when the Dockerfile or this workflow file itself is modified. This is
+# done to conserve GitHub Actions minutes, as there is no need to rebuild the
+# Docker image if only Python source code or documentation has changed.
+#
+# The build step performs a "Dry Run" using Docker Buildx. It does not push
+# the resulting image to any container registry (like Docker Hub or GHCR),
+# ensuring this workflow remains safe and has no side effects.
+#
+# Formal publishing of the Docker image (e.g., to GHCR) is out of scope here
+# and should be handled by a separate release workflow.
+
+name: Docker Build & Lint Check
+
+on:
+  push:
+    branches: [ "main" ]
+    paths:
+      - 'Dockerfile'
+      - '.github/workflows/docker-check.yml'
+  pull_request:
+    branches: [ "main" ]
+    paths:
+      - 'Dockerfile'
+      - '.github/workflows/docker-check.yml'
+
+permissions:
+  contents: read
+
+# Serialize runs for the same PR/branch to avoid redundant checks.
+# We use cancel-in-progress to abort older runs if a new commit is pushed.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # The single job that runs on GitHub-hosted runners to lint and build.
+  lint-and-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # We use hadolint to enforce Dockerfile best practices.
+      # It will catch common anti-patterns like leaving apt caches behind
+      # or running multiple RUN commands unnecessarily.
+      - name: Lint Dockerfile
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: Dockerfile
+          # Ignore DL3008: Pin versions in apt get install (since we want the latest security patches for basic tools)
+          ignore: DL3008
+
+      # Set up modern Docker Buildx for advanced caching and multi-arch support (if needed in the future).
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Perform a dry-run build of the Dockerfile.
+      # This ensures the Dockerfile builds successfully from top to bottom
+      # but does NOT push the image to any registry (`push: false`).
+      - name: Build Docker Image (Dry Run)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          push: false
+          tags: freetoken:test
+          # Utilize GitHub Actions Cache to speed up subsequent builds.
+          # The max mode caches all layers, significantly reducing build times
+          # for future PRs unless the base image or apt installs change.
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

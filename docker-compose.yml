@@ -1,0 +1,17 @@
+services:
+  freetoken:
+    build: .
+    container_name: freetoken-server
+    ports:
+      - "8080:8080"
+    volumes:
+      # Mount your local models directory into the container
+      # Update the left side of the colon to where your models are stored locally
+      - ~/.cache/huggingface:/root/.cache/huggingface
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
